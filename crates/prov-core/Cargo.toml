@@ -11,5 +11,15 @@ description = "Core library for prov: schema, resolver, storage, redactor for pr
 keywords = ["git", "provenance", "claude", "ai", "notes"]
 categories = ["development-tools"]
 
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+blake3 = "1.5"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3.13"
+
 [lints]
 workspace = true

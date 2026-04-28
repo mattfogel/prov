@@ -5,12 +5,11 @@
 //! `prov-cli`. Other tools (an editor plugin, a future LSP, an analytics pipeline)
 //! can depend on this crate without inheriting the CLI's surface.
 
-/// Prov schema version this build of `prov-core` writes and reads.
-///
-/// Notes carry an explicit `version` field; readers refuse to parse unknown
-/// versions to surface schema drift early. Forward-compatibility within a major
-/// version is preserved by tolerating unknown sibling fields.
-pub const SCHEMA_VERSION: u32 = 1;
+pub mod git;
+pub mod schema;
+pub mod storage;
+
+pub use schema::SCHEMA_VERSION;
 
 /// Returns the package version (`CARGO_PKG_VERSION`).
 pub fn version() -> &'static str {

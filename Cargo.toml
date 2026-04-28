@@ -27,6 +27,9 @@ missing_errors_doc = "allow"
 # CLI Args structs naturally accumulate >3 boolean flags; refactoring into enums
 # adds boilerplate without clarity. Allow at workspace level.
 struct_excessive_bools = "allow"
+# `SQLite`, `JSON`, `BLAKE3`, `FTS5`, etc. trigger doc_markdown across the
+# codebase. Backticking every initialism in prose adds noise without clarity.
+doc_markdown = "allow"
 
 [profile.release]
 lto = "thin"
