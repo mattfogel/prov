@@ -503,6 +503,7 @@ name = "prov-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
