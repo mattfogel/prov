@@ -1,0 +1,15 @@
+[package]
+name = "prov-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core library for prov: schema, resolver, storage, redactor for prompt-provenance tracking"
+keywords = ["git", "provenance", "claude", "ai", "notes"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true
