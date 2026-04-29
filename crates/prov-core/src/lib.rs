@@ -9,6 +9,7 @@ pub mod git;
 pub mod redactor;
 pub mod resolver;
 pub mod schema;
+pub mod session;
 pub mod storage;
 
 pub use resolver::{NoProvenanceReason, ResolveResult, Resolver, ResolverError};
