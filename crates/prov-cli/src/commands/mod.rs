@@ -5,6 +5,7 @@
 //! later units fill in implementations without re-wiring the CLI.
 
 pub mod backfill;
+pub mod common;
 pub mod fetch;
 pub mod gc;
 pub mod hook;

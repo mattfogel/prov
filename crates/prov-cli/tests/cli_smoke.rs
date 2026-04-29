@@ -59,10 +59,10 @@ fn no_subcommand_prints_help_and_errors() {
 
 #[test]
 fn unimplemented_stub_exits_with_code_2() {
-    // Any Phase-1 stub command should exit 2 with a clear message rather than panic.
+    // U5 wired up the read CLI (log/search/reindex/pr-timeline/install/uninstall);
+    // the remaining Phase-2/3 commands are still stubs. `repair` is one of them.
     prov()
-        .arg("search")
-        .arg("anything")
+        .arg("repair")
         .assert()
         .failure()
         .code(2)
