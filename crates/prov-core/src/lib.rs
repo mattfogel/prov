@@ -7,9 +7,11 @@
 
 pub mod git;
 pub mod redactor;
+pub mod resolver;
 pub mod schema;
 pub mod storage;
 
+pub use resolver::{NoProvenanceReason, ResolveResult, Resolver, ResolverError};
 pub use schema::SCHEMA_VERSION;
 
 /// Returns the package version (`CARGO_PKG_VERSION`).
