@@ -1,0 +1,6 @@
+{
+  "session_id": "sess_fixture001",
+  "prompt": "add a hello function in src/lib.rs",
+  "cwd": "/repo",
+  "transcript_path": "/tmp/sess_fixture001.jsonl"
+}

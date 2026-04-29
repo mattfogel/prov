@@ -1,0 +1,14 @@
+{
+  "session_id": "sess_fixture001",
+  "tool_name": "MultiEdit",
+  "tool_use_id": "toolu_fixture_m",
+  "tool_input": {
+    "file_path": "src/lib.rs",
+    "edits": [
+      { "old_string": "alpha", "new_string": "ALPHA" },
+      { "old_string": "beta",  "new_string": "BETA"  },
+      { "old_string": "gamma", "new_string": "GAMMA" }
+    ]
+  },
+  "tool_response": {}
+}

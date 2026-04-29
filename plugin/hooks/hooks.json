@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "command": "prov hook session-start",
+        "timeout": 5
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "command": "prov hook user-prompt-submit",
+        "timeout": 5
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "command": "prov hook post-tool-use",
+        "timeout": 5
+      }
+    ],
+    "Stop": [
+      {
+        "command": "prov hook stop",
+        "timeout": 5
+      }
+    ]
+  }
+}

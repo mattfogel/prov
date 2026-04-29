@@ -1,0 +1,10 @@
+{
+  "session_id": "sess_fixture001",
+  "tool_name": "Write",
+  "tool_use_id": "toolu_fixture_w",
+  "tool_input": {
+    "file_path": "src/lib.rs",
+    "content": "pub fn hello() -> &'static str {\n    \"hello, prov\"\n}\n"
+  },
+  "tool_response": {}
+}

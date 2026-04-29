@@ -1,0 +1,11 @@
+{
+  "session_id": "sess_fixture001",
+  "tool_name": "Edit",
+  "tool_use_id": "toolu_fixture_e",
+  "tool_input": {
+    "file_path": "src/lib.rs",
+    "old_string": "\"hello, prov\"",
+    "new_string": "\"hello, world\""
+  },
+  "tool_response": {}
+}

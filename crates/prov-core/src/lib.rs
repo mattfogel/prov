@@ -8,6 +8,7 @@
 pub mod git;
 pub mod redactor;
 pub mod schema;
+pub mod session;
 pub mod storage;
 
 pub use schema::SCHEMA_VERSION;

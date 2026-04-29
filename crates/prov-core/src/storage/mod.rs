@@ -9,6 +9,7 @@
 
 pub mod notes;
 pub mod sqlite;
+pub mod staging;
 
 /// Default git ref where prov stores public (push-eligible) notes.
 pub const NOTES_REF_PUBLIC: &str = "refs/notes/prompts";

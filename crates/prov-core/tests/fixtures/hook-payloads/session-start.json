@@ -1,0 +1,6 @@
+{
+  "session_id": "sess_fixture001",
+  "model": "claude-sonnet-4-5",
+  "transcript_path": "/tmp/sess_fixture001.jsonl",
+  "cwd": "/repo"
+}

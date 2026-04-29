@@ -1,0 +1,14 @@
+#!/bin/sh
+# prov post-commit hook
+#
+# Calls `prov hook post-commit`, which walks `.git/prov-staging/` and flushes
+# any staged edits matching the just-created commit's diff into a JSON note
+# attached at `refs/notes/prompts`.
+#
+# Defensive: never block the commit. The Rust handler already exits 0 on
+# internal failure; we wrap in a redirect-and-true so even a missing binary
+# (e.g., user uninstalled prov but left the hook) does not break commits.
+
+prov hook post-commit </dev/null >/dev/null 2>&1 || true
+
+exit 0
