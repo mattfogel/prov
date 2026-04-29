@@ -321,8 +321,7 @@ fn unix_now() -> i64 {
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Errors raised by `Cache`.
