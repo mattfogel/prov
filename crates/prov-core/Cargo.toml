@@ -1,0 +1,26 @@
+[package]
+name = "prov-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core library for prov: schema, resolver, storage, redactor for prompt-provenance tracking"
+keywords = ["git", "provenance", "claude", "ai", "notes"]
+categories = ["development-tools"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+blake3 = "1.5"
+rusqlite = { version = "0.32", features = ["bundled"] }
+regex = "1.11"
+
+[dev-dependencies]
+tempfile = "3.13"
+
+[lints]
+workspace = true
