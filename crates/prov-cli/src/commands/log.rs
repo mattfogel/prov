@@ -265,7 +265,11 @@ fn render_point_text(result: &ResolveResult, file: &std::path::Path, line: u32, 
             }
         }
         ResolveResult::NoProvenance { reason } => {
-            println!("{}:{line}: no provenance ({})", file.display(), describe_reason(reason));
+            println!(
+                "{}:{line}: no provenance ({})",
+                file.display(),
+                describe_reason(reason)
+            );
         }
     }
 }
@@ -293,7 +297,11 @@ fn render_whole_file_text(
     for e in edits {
         println!(
             "  L{}-{}  {}  {}  {}",
-            e.line_start, e.line_end, e.timestamp, &e.commit_sha[..short_sha_len(&e.commit_sha)], e.model
+            e.line_start,
+            e.line_end,
+            e.timestamp,
+            &e.commit_sha[..short_sha_len(&e.commit_sha)],
+            e.model
         );
         println!("    {}", e.prompt);
     }

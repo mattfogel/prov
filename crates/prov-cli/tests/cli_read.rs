@@ -33,7 +33,11 @@ fn git_capture(cwd: &Path, args: &[&str]) -> String {
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
         .expect("git capture");
-    assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout).unwrap()
 }
 
@@ -122,7 +126,8 @@ fn install_is_idempotent() {
 
     prov_in(tmp.path()).arg("install").assert().success();
     let second_hook = std::fs::read_to_string(tmp.path().join(".git/hooks/post-commit")).unwrap();
-    let second_settings = std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
+    let second_settings =
+        std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
 
     assert_eq!(first_hook, second_hook);
     assert_eq!(first_settings, second_settings);
@@ -185,16 +190,24 @@ fn install_plugin_flag_does_not_touch_repo() {
 #[test]
 fn install_enable_push_configures_fetch_refspec() {
     let tmp = init_repo();
-    run_git(tmp.path(), &["remote", "add", "origin", "https://example.com/repo.git"]);
+    run_git(
+        tmp.path(),
+        &["remote", "add", "origin", "https://example.com/repo.git"],
+    );
 
     prov_in(tmp.path())
         .args(["install", "--enable-push", "origin"])
         .assert()
         .success();
 
-    let fetches = git_capture(tmp.path(), &["config", "--local", "--get-all", "remote.origin.fetch"]);
+    let fetches = git_capture(
+        tmp.path(),
+        &["config", "--local", "--get-all", "remote.origin.fetch"],
+    );
     assert!(
-        fetches.lines().any(|l| l == "refs/notes/prompts:refs/notes/origin/prompts"),
+        fetches
+            .lines()
+            .any(|l| l == "refs/notes/prompts:refs/notes/origin/prompts"),
         "expected prov refspec; got: {fetches}"
     );
 }
@@ -279,7 +292,9 @@ fn repo_with_note(prompt: &str, file: &str, line: u32, hashes: &[String]) -> (Te
     std::fs::write(tmp.path().join(file), body).unwrap();
     run_git(tmp.path(), &["add", file]);
     run_git(tmp.path(), &["commit", "-q", "-m", "initial"]);
-    let sha = git_capture(tmp.path(), &["rev-parse", "HEAD"]).trim().to_string();
+    let sha = git_capture(tmp.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
 
     // Compute real BLAKE3 hashes for each line so the resolver reports `Unchanged`.
     let real_hashes: Vec<String> = (0..hashes.len())
@@ -293,7 +308,10 @@ fn repo_with_note(prompt: &str, file: &str, line: u32, hashes: &[String]) -> (Te
     let store = NotesStore::new(git, NOTES_REF_PUBLIC);
     let _ = hashes; // hashes count is captured via real_hashes; suppress unused-binding lint.
     store
-        .write(&sha, &Note::new(vec![make_edit(file, prompt, line, real_hashes)]))
+        .write(
+            &sha,
+            &Note::new(vec![make_edit(file, prompt, line, real_hashes)]),
+        )
         .unwrap();
 
     // Run reindex via the CLI so the cache is populated as the user would see it.
@@ -320,12 +338,7 @@ fn log_point_lookup_returns_unchanged_for_matching_line() {
 
 #[test]
 fn log_point_lookup_no_provenance_when_line_outside_range() {
-    let (tmp, _sha) = repo_with_note(
-        "p",
-        "f.rs",
-        1,
-        &["a".into(), "b".into(), "c".into()],
-    );
+    let (tmp, _sha) = repo_with_note("p", "f.rs", 1, &["a".into(), "b".into(), "c".into()]);
     prov_in(tmp.path())
         .args(["log", "f.rs:99"])
         .assert()
@@ -335,12 +348,7 @@ fn log_point_lookup_no_provenance_when_line_outside_range() {
 
 #[test]
 fn log_whole_file_lists_edits_with_json_envelope() {
-    let (tmp, _sha) = repo_with_note(
-        "wholefile",
-        "x.rs",
-        1,
-        &["a".into(), "b".into()],
-    );
+    let (tmp, _sha) = repo_with_note("wholefile", "x.rs", 1, &["a".into(), "b".into()]);
     let out = prov_in(tmp.path())
         .args(["log", "x.rs", "--json"])
         .assert()
@@ -358,12 +366,7 @@ fn log_whole_file_lists_edits_with_json_envelope() {
 
 #[test]
 fn log_only_if_substantial_returns_empty_for_short_files() {
-    let (tmp, _sha) = repo_with_note(
-        "short",
-        "tiny.rs",
-        1,
-        &["a".into(), "b".into()],
-    );
+    let (tmp, _sha) = repo_with_note("short", "tiny.rs", 1, &["a".into(), "b".into()]);
     // tiny.rs has 2 lines (plus trailing newline) — under the substantial threshold.
     prov_in(tmp.path())
         .args(["log", "tiny.rs", "--only-if-substantial", "--json"])
@@ -453,12 +456,7 @@ fn pr_timeline_renders_markdown_for_resolved_lines() {
 
 #[test]
 fn pr_timeline_json_envelope_is_valid() {
-    let (tmp, _sha) = repo_with_note(
-        "json shape",
-        "f.rs",
-        1,
-        &["a".into(), "b".into()],
-    );
+    let (tmp, _sha) = repo_with_note("json shape", "f.rs", 1, &["a".into(), "b".into()]);
     let empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
     let out = prov_in(tmp.path())
         .args([

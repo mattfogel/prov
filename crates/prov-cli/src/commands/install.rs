@@ -166,15 +166,15 @@ fn render_hook_block(body: &str) -> String {
         .skip_while(|l| l.starts_with("#!"))
         .collect::<Vec<_>>()
         .join("\n");
-    format!(
-        "{HOOK_BLOCK_BEGIN}\n{body}\n{HOOK_BLOCK_END}\n"
-    )
+    format!("{HOOK_BLOCK_BEGIN}\n{body}\n{HOOK_BLOCK_END}\n")
 }
 
 /// Insert or replace the prov-managed block in an existing hook script.
 fn merge_hook_block(existing: &str, prov_block: &str) -> String {
-    if let (Some(start), Some(end)) = (existing.find(HOOK_BLOCK_BEGIN), existing.find(HOOK_BLOCK_END))
-    {
+    if let (Some(start), Some(end)) = (
+        existing.find(HOOK_BLOCK_BEGIN),
+        existing.find(HOOK_BLOCK_END),
+    ) {
         let end_with_newline = end + HOOK_BLOCK_END.len();
         let trailing = existing[end_with_newline..]
             .strip_prefix('\n')
@@ -247,9 +247,9 @@ fn install_claude_settings(git: &Git) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow!("`hooks` in {} must be an object", path.display()))?;
 
     for (event, plugin_entries) in &plugin_hooks_obj {
-        let plugin_entries_arr = plugin_entries.as_array().ok_or_else(|| {
-            anyhow!("plugin hook event `{event}` must be a JSON array")
-        })?;
+        let plugin_entries_arr = plugin_entries
+            .as_array()
+            .ok_or_else(|| anyhow!("plugin hook event `{event}` must be a JSON array"))?;
         let user_entries = hooks_obj
             .entry(event.clone())
             .or_insert_with(|| Value::Array(Vec::new()))
@@ -284,8 +284,8 @@ fn write_pretty_json(path: &Path, value: &Value) -> anyhow::Result<()> {
 // -------- cache initialization --------
 
 fn initialize_cache(git: &Git, cache_path: &Path) -> anyhow::Result<()> {
-    let mut cache = Cache::open(cache_path)
-        .with_context(|| format!("opening {}", cache_path.display()))?;
+    let mut cache =
+        Cache::open(cache_path).with_context(|| format!("opening {}", cache_path.display()))?;
     let store = NotesStore::new(git.clone(), NOTES_REF_PUBLIC);
     let _stats = cache.reindex_from(&store)?;
     Ok(())

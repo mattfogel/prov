@@ -42,9 +42,8 @@ impl RepoHandles {
         };
         let notes = NotesStore::new(git.clone(), NOTES_REF_PUBLIC);
         let cache_path = git.git_dir().join(CACHE_FILENAME);
-        let cache = Cache::open(&cache_path).with_context(|| {
-            format!("failed to open prov cache at {}", cache_path.display())
-        })?;
+        let cache = Cache::open(&cache_path)
+            .with_context(|| format!("failed to open prov cache at {}", cache_path.display()))?;
         Ok(Self {
             git,
             notes,

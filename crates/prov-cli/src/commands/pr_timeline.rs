@@ -110,7 +110,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
-    add_superseded(&mut builder, &cache_for_super, &notes_for_super, &pr_commits, &surviving_turns)?;
+    add_superseded(
+        &mut builder,
+        &cache_for_super,
+        &notes_for_super,
+        &pr_commits,
+        &surviving_turns,
+    )?;
 
     let timeline = builder.build();
 
@@ -125,12 +131,16 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn open_supplementary_cache(handles: &RepoHandles) -> anyhow::Result<prov_core::storage::sqlite::Cache> {
+fn open_supplementary_cache(
+    handles: &RepoHandles,
+) -> anyhow::Result<prov_core::storage::sqlite::Cache> {
     // We need a separate Cache handle for the superseded-turn pass because
     // `into_resolver()` consumes the original. Opening twice on the same file
     // is safe — SQLite handles concurrent readers in WAL mode and each handle
     // applies its own schema-init no-op.
-    Ok(prov_core::storage::sqlite::Cache::open(&handles.cache_path)?)
+    Ok(prov_core::storage::sqlite::Cache::open(
+        &handles.cache_path,
+    )?)
 }
 
 fn add_superseded(
@@ -181,13 +191,7 @@ fn added_lines_in_range(
     head: &str,
 ) -> anyhow::Result<BTreeMap<String, Vec<u32>>> {
     let range = format!("{base}..{head}");
-    let raw = git.capture([
-        "diff",
-        "--unified=0",
-        "--no-color",
-        "--no-renames",
-        &range,
-    ])?;
+    let raw = git.capture(["diff", "--unified=0", "--no-color", "--no-renames", &range])?;
     Ok(parse_diff_added_lines(&raw))
 }
 

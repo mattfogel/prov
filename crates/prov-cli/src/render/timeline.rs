@@ -143,7 +143,11 @@ impl Timeline {
         } else {
             "sessions"
         };
-        let turns_word = if self.total_turns == 1 { "turn" } else { "turns" };
+        let turns_word = if self.total_turns == 1 {
+            "turn"
+        } else {
+            "turns"
+        };
         let mut s = format!(
             "This PR contains {} {turns_word} across {} Claude Code {session_word}",
             self.total_turns,
@@ -443,11 +447,7 @@ fn collapse_ranges(map: BTreeMap<String, Vec<u32>>) -> Vec<NoProvenanceRange> {
             line_end: end,
         });
     }
-    out.sort_by(|a, b| {
-        a.file
-            .cmp(&b.file)
-            .then(a.line_start.cmp(&b.line_start))
-    });
+    out.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_start.cmp(&b.line_start)));
     out
 }
 
@@ -595,6 +595,8 @@ mod tests {
             timestamp: "2026-01-01T00:00:00Z",
         });
         let t = b.build();
-        assert!(t.summary_line().contains("1 turn across 1 Claude Code session."));
+        assert!(t
+            .summary_line()
+            .contains("1 turn across 1 Claude Code session."));
     }
 }

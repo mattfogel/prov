@@ -128,8 +128,7 @@ fn uninstall_claude_settings(git: &Git) -> anyhow::Result<()> {
     }
 
     if root.is_empty() {
-        fs::remove_file(&path)
-            .with_context(|| format!("removing {}", path.display()))?;
+        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
     } else {
         fs::write(
             &path,
@@ -218,7 +217,20 @@ fn regex_escape(s: &str) -> String {
     for c in s.chars() {
         if matches!(
             c,
-            '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '\\' | '^' | '$' | '/'
+            '.' | '+'
+                | '*'
+                | '?'
+                | '('
+                | ')'
+                | '|'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '\\'
+                | '^'
+                | '$'
+                | '/'
         ) {
             out.push('\\');
         }
@@ -273,10 +285,8 @@ mod tests {
 
     #[test]
     fn strip_prov_entries_drops_empty_event_keys() {
-        let mut root: Map<String, Value> = serde_json::from_str(
-            r#"{"hooks":{"Stop":[{"command":"prov hook stop"}]}}"#,
-        )
-        .unwrap();
+        let mut root: Map<String, Value> =
+            serde_json::from_str(r#"{"hooks":{"Stop":[{"command":"prov hook stop"}]}}"#).unwrap();
         let removed = strip_prov_entries(&mut root);
         assert!(removed);
         // Hooks object becomes empty → root drops it entirely.
