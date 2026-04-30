@@ -8,7 +8,15 @@
 # Defensive: never block the commit. The Rust handler already exits 0 on
 # internal failure; we wrap in a redirect-and-true so even a missing binary
 # (e.g., user uninstalled prov but left the hook) does not break commits.
+#
+# We also wrap in `timeout 15` when the coreutils `timeout(1)` is available so
+# a hung handler cannot stall the commit forever. macOS without coreutils has
+# no `timeout(1)`; in that case we run the handler directly.
 
-prov hook post-commit </dev/null >/dev/null 2>&1 || true
+if command -v timeout >/dev/null 2>&1; then
+    timeout 15 prov hook post-commit </dev/null >/dev/null 2>&1 || true
+else
+    prov hook post-commit </dev/null >/dev/null 2>&1 || true
+fi
 
 exit 0
