@@ -152,7 +152,7 @@ fn install_hook(path: &Path, prov_body: &str) -> anyhow::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => format!("#!/bin/sh\n{prov_block}"),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    fs::write(path, &new_contents)?;
+    atomic_write(path, new_contents.as_bytes())?;
     set_executable(path)?;
     Ok(())
 }
@@ -274,10 +274,39 @@ fn install_claude_settings(git: &Git) -> anyhow::Result<()> {
 }
 
 fn write_pretty_json(path: &Path, value: &Value) -> anyhow::Result<()> {
-    let mut f = fs::File::create(path)?;
     let mut buf = serde_json::to_vec_pretty(value)?;
     buf.push(b'\n');
-    f.write_all(&buf)?;
+    atomic_write(path, &buf)?;
+    Ok(())
+}
+
+/// Write `bytes` to `path` atomically: write to `<path>.tmp`, fsync, then
+/// rename into place. A killed mid-write process leaves at most a `.tmp` file
+/// rather than truncating the real target.
+fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let tmp_path = match path.file_name() {
+        Some(name) => {
+            let mut tmp = name.to_os_string();
+            tmp.push(".tmp");
+            path.with_file_name(tmp)
+        }
+        None => return Err(anyhow!("invalid target path: {}", path.display())),
+    };
+    {
+        let mut f = fs::File::create(&tmp_path)
+            .with_context(|| format!("creating {}", tmp_path.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("writing {}", tmp_path.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", tmp_path.display()))?;
+    }
+    fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "renaming {} → {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
     Ok(())
 }
 

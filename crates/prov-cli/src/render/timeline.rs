@@ -26,8 +26,13 @@ pub struct Timeline {
     pub total_turns: u32,
     /// Total lines in the diff that resolved to no provenance.
     pub total_no_provenance_lines: u32,
-    /// Prov version that generated the comment (for the footer).
+    /// Prov version that generated the comment (for the footer). Retained for
+    /// the existing JSON contract — `prov_version` is the canonical name shared
+    /// across other CLI envelopes (`log`, `search`, `reindex`).
     pub generator_version: String,
+    /// Prov version that emitted this envelope. Mirrors `generator_version`
+    /// under the canonical name used by other CLI surfaces.
+    pub prov_version: String,
 }
 
 /// One Claude Code session as it surfaced in the PR diff.
@@ -393,7 +398,8 @@ impl TimelineBuilder {
             no_provenance,
             total_turns,
             total_no_provenance_lines: self.total_no_prov,
-            generator_version: self.generator_version,
+            generator_version: self.generator_version.clone(),
+            prov_version: self.generator_version,
         }
     }
 }
@@ -462,6 +468,7 @@ mod tests {
             total_turns: 0,
             total_no_provenance_lines: 0,
             generator_version: "0.1.0".into(),
+            prov_version: "0.1.0".into(),
         }
     }
 

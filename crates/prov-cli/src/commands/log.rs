@@ -17,7 +17,6 @@
 
 use std::path::PathBuf;
 
-use anyhow::Context;
 use clap::Parser;
 use serde::Serialize;
 
@@ -32,7 +31,7 @@ const SUBSTANTIAL_MIN_LINES: usize = 10;
 #[derive(Parser, Debug)]
 pub struct Args {
     /// File path, optionally with `:<line>` suffix.
-    pub target: Option<String>,
+    pub target: String,
     /// Show provenance history including superseded prompts.
     #[arg(long)]
     pub history: bool,
@@ -49,16 +48,12 @@ pub struct Args {
 
 #[allow(clippy::needless_pass_by_value)]
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let target = args
-        .target
-        .as_deref()
-        .context("usage: prov log <file>[:<line>]")?;
-    let (file, line) = parse_target(target);
+    let (file, line) = parse_target(&args.target);
 
     let handles = RepoHandles::open()?;
 
     if args.only_if_substantial && !is_substantial(&handles, &file)? {
-        emit_empty(args.json);
+        emit_empty(args.json, &file);
         return Ok(());
     }
 
@@ -134,6 +129,7 @@ fn whole_file_lookup(
             file: file_str.clone(),
             edits: edits.iter().map(EditJson::from_row).collect(),
             history: history.iter().map(EditJson::from_history).collect(),
+            prov_version: env!("CARGO_PKG_VERSION"),
         };
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
@@ -206,9 +202,19 @@ struct HistoryEntry {
     edit: prov_core::schema::Edit,
 }
 
-fn emit_empty(json: bool) {
+fn emit_empty(json: bool, file: &std::path::Path) {
     if json {
-        println!(r#"{{"edits":[],"history":[]}}"#);
+        // Match `WholeFileJson`'s shape so downstream consumers can deserialize
+        // both with one struct.
+        let payload = WholeFileJson {
+            file: file.to_string_lossy().into_owned(),
+            edits: Vec::new(),
+            history: Vec::new(),
+            prov_version: env!("CARGO_PKG_VERSION"),
+        };
+        if let Ok(s) = serde_json::to_string(&payload) {
+            println!("{s}");
+        }
     }
     // Non-JSON: stay silent. The Skill consumes JSON; humans calling
     // `--only-if-substantial` already know to interpret silence as "skip".
@@ -352,6 +358,8 @@ struct PointJson {
     blame_author_after: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     no_provenance_reason: Option<String>,
+    /// Prov version that emitted this envelope (for downstream version pinning).
+    prov_version: &'static str,
 }
 
 impl PointJson {
@@ -379,6 +387,7 @@ impl PointJson {
                 blame_commit: Some(blame_commit.clone()),
                 blame_author_after: None,
                 no_provenance_reason: None,
+                prov_version: env!("CARGO_PKG_VERSION"),
             },
             ResolveResult::Drifted {
                 prompt,
@@ -401,6 +410,7 @@ impl PointJson {
                 blame_commit: Some(blame_commit.clone()),
                 blame_author_after: Some(blame_author_after.clone()),
                 no_provenance_reason: None,
+                prov_version: env!("CARGO_PKG_VERSION"),
             },
             ResolveResult::NoProvenance { reason } => Self {
                 file,
@@ -414,6 +424,7 @@ impl PointJson {
                 blame_commit: None,
                 blame_author_after: None,
                 no_provenance_reason: Some(describe_reason(reason).into()),
+                prov_version: env!("CARGO_PKG_VERSION"),
             },
         }
     }
@@ -424,6 +435,8 @@ struct WholeFileJson {
     file: String,
     edits: Vec<EditJson>,
     history: Vec<EditJson>,
+    /// Prov version that emitted this envelope (for downstream version pinning).
+    prov_version: &'static str,
 }
 
 #[derive(Serialize)]

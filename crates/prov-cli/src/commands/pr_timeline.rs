@@ -202,7 +202,9 @@ pub(crate) fn parse_diff_added_lines(raw: &str) -> BTreeMap<String, Vec<u32>> {
     for line in raw.lines() {
         if let Some(rest) = line.strip_prefix("+++ ") {
             // `+++ b/<path>` for a file that exists on the head side; `/dev/null`
-            // for deletions (no head content to attribute).
+            // for deletions (no head content to attribute). The space after
+            // `+++` is what distinguishes a real header from a content line
+            // whose body happens to start with `+++`.
             current_file = if rest == "/dev/null" {
                 None
             } else if let Some(path) = rest.strip_prefix("b/") {
