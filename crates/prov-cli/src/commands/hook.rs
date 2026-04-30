@@ -23,7 +23,6 @@
 
 use std::io::{self, Read};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
@@ -35,6 +34,7 @@ use prov_core::session::SessionId;
 use prov_core::storage::notes::NotesStore;
 use prov_core::storage::staging::{EditRecord, SessionMeta, Staging, StagingError, TurnRecord};
 use prov_core::storage::NOTES_REF_PUBLIC;
+use prov_core::time::now_iso8601;
 
 #[derive(Parser, Debug)]
 pub struct Args {
@@ -228,15 +228,51 @@ fn handle_post_tool_use(staging: &Staging) -> Result<(), HandlerError> {
 }
 
 fn current_turn_is_private(staging: &Staging, sid: &SessionId) -> bool {
-    let public = staging.read_turns(sid, false).unwrap_or_default();
-    let private = staging.read_turns(sid, true).unwrap_or_default();
-    let last_public_started = public.last().map(|t| t.started_at.clone());
-    let last_private_started = private.last().map(|t| t.started_at.clone());
-    match (last_public_started, last_private_started) {
+    let last_public = most_recent_turn_started_at(staging, sid, false);
+    let last_private = most_recent_turn_started_at(staging, sid, true);
+    match (last_public, last_private) {
         (Some(p), Some(pr)) => pr > p,
         (None, Some(_)) => true,
         _ => false,
     }
+}
+
+/// Find the most recent `turn-<N>.json` in the (public or private) session
+/// directory and return its `started_at` field. Avoids reading every turn
+/// just to compare timestamps — we only need the last one in either subtree.
+fn most_recent_turn_started_at(
+    staging: &Staging,
+    sid: &SessionId,
+    private: bool,
+) -> Option<String> {
+    let dir = staging.session_dir(sid, private);
+    if !dir.exists() {
+        return None;
+    }
+    let entries = std::fs::read_dir(&dir).ok()?;
+    let mut best: Option<(u32, std::path::PathBuf)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else { continue };
+        let Some(num) = s
+            .strip_prefix("turn-")
+            .and_then(|s| s.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let Ok(n) = num.parse::<u32>() else { continue };
+        let bigger = match best.as_ref() {
+            None => true,
+            Some((b, _)) => n > *b,
+        };
+        if bigger {
+            best = Some((n, entry.path()));
+        }
+    }
+    let (_, path) = best?;
+    let bytes = std::fs::read(&path).ok()?;
+    let rec: TurnRecord = serde_json::from_slice(&bytes).ok()?;
+    Some(rec.started_at)
 }
 
 /// Decompose one PostToolUse payload into one or more `EditRecord`s.
@@ -441,7 +477,9 @@ fn handle_post_commit(git: &Git, staging: &Staging) -> Result<(), HandlerError> 
 
     let sessions = staging.list_sessions().unwrap_or_default();
     let mut matched_edits: Vec<Edit> = Vec::new();
-    let mut matched_keys: Vec<(SessionId, MatchedKey)> = Vec::new();
+    // (session, file, line-range) tuple uniquely identifying each matched
+    // edit so the cleanup pass below can count which sessions are fully done.
+    let mut matched_keys: Vec<(SessionId, String, [u32; 2])> = Vec::new();
 
     for sid in &sessions {
         let session_meta = staging
@@ -470,18 +508,18 @@ fn handle_post_commit(git: &Git, staging: &Staging) -> Result<(), HandlerError> 
                 file: er.file.clone(),
                 line_range: matched.line_range,
                 content_hashes: er.content_hashes.clone(),
-                original_blob_sha: String::new(),
+                original_blob_sha: None,
                 prompt,
                 conversation_id: er.session_id.clone(),
                 turn_index: er.turn_index,
                 tool_use_id: er.tool_use_id.clone(),
-                preceding_turns_summary: String::new(),
+                preceding_turns_summary: None,
                 model: session_meta.model.clone(),
                 tool: "claude-code".into(),
                 timestamp: er.timestamp.clone(),
                 derived_from: None,
             });
-            matched_keys.push((sid.clone(), matched.key));
+            matched_keys.push((sid.clone(), er.file.clone(), matched.line_range));
         }
     }
 
@@ -511,7 +549,7 @@ fn handle_post_commit(git: &Git, staging: &Staging) -> Result<(), HandlerError> 
     // dir. Partial-match cleanup (rewriting edits.jsonl) is U9-territory.
     for sid in &sessions {
         let still = staging.read_edits(sid, false).unwrap_or_default();
-        let matched_in_session = matched_keys.iter().filter(|(s, _)| s == sid).count();
+        let matched_in_session = matched_keys.iter().filter(|(s, _, _)| s == sid).count();
         if !still.is_empty() && matched_in_session == still.len() {
             staging.remove_session(sid).ok();
         }
@@ -520,16 +558,9 @@ fn handle_post_commit(git: &Git, staging: &Staging) -> Result<(), HandlerError> 
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MatchedKey {
-    file: String,
-    line_range: [u32; 2],
-}
-
 #[derive(Debug)]
 struct Match {
     line_range: [u32; 2],
-    key: MatchedKey,
 }
 
 fn match_edit_to_diff(
@@ -546,13 +577,7 @@ fn match_edit_to_diff(
     let added_content: Vec<String> = added.iter().map(|l| l.content.clone()).collect();
     let after_lines: Vec<&str> = er.after.split('\n').collect();
     if let Some(range) = exact_window_match_str(&after_lines, &added_content, added) {
-        return Some(Match {
-            line_range: range,
-            key: MatchedKey {
-                file: er.file.clone(),
-                line_range: range,
-            },
-        });
+        return Some(Match { line_range: range });
     }
 
     // Strategy b: normalized — strip trailing whitespace, collapse internal
@@ -561,13 +586,7 @@ fn match_edit_to_diff(
     let norm_after: Vec<String> = after_lines.iter().map(|l| normalize(l)).collect();
     let norm_added: Vec<String> = added_content.iter().map(|l| normalize(l)).collect();
     if let Some(range) = exact_window_match_norm(&norm_after, &norm_added, added) {
-        return Some(Match {
-            line_range: range,
-            key: MatchedKey {
-                file: er.file.clone(),
-                line_range: range,
-            },
-        });
+        return Some(Match { line_range: range });
     }
 
     // Strategy c: line-range proximity — capture's `[start, end]` overlaps
@@ -578,13 +597,7 @@ fn match_edit_to_diff(
     if let Some(window) = added_window(added) {
         let overlap = window_overlap(captured, window);
         if captured_len > 0 && overlap * 2 >= captured_len {
-            return Some(Match {
-                line_range: window,
-                key: MatchedKey {
-                    file: er.file.clone(),
-                    line_range: window,
-                },
-            });
+            return Some(Match { line_range: window });
         }
     }
     None
@@ -712,7 +725,11 @@ fn parse_unified_diff_added(raw: &str) -> std::collections::HashMap<String, Vec<
             current_file = Some(rest.to_string());
             continue;
         }
-        if line.starts_with("+++") || line.starts_with("---") {
+        // Real diff header lines are exactly `+++ ` or `--- ` followed by a
+        // path (or `/dev/null`). We must not skip content lines whose body
+        // happens to start with `+++` or `---` (e.g., a Markdown rule, or the
+        // diff itself being captured as text).
+        if is_diff_header(line) {
             continue;
         }
         if let Some(rest) = line.strip_prefix("@@ ") {
@@ -748,6 +765,14 @@ fn parse_unified_diff_added(raw: &str) -> std::collections::HashMap<String, Vec<
     out
 }
 
+/// Distinguish a real `--- a/...` / `+++ b/...` (or `/dev/null`) diff header
+/// from a content line whose body just happens to start with `+++` or `---`
+/// (e.g., an added Markdown horizontal rule). A real header always has a
+/// space after the prefix; content `+++`/`---` do not.
+fn is_diff_header(line: &str) -> bool {
+    line.starts_with("+++ ") || line.starts_with("--- ")
+}
+
 fn read_cherry_pick_head(git: &Git) -> Option<String> {
     let path = git.git_dir().join("CHERRY_PICK_HEAD");
     let s = std::fs::read_to_string(path).ok()?;
@@ -771,10 +796,23 @@ enum HandlerError {
 }
 
 fn read_stdin_json<T: for<'de> Deserialize<'de>>() -> Result<T, HandlerError> {
+    /// Hard cap on hook-payload size. Real Claude Code hook payloads are tiny
+    /// (a few KB at most); the cap defends against a runaway agent piping
+    /// gigabytes into the handler and OOM-ing the commit.
+    const MAX_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
+
     let mut buf = String::new();
-    io::stdin()
+    // Read one byte past the cap so we can distinguish "exactly at the cap" from
+    // "over the cap" without a separate length probe.
+    let bytes_read = io::stdin()
+        .take(MAX_PAYLOAD_BYTES + 1)
         .read_to_string(&mut buf)
         .map_err(|e| HandlerError::Stdin(e.to_string()))?;
+    if u64::try_from(bytes_read).unwrap_or(u64::MAX) > MAX_PAYLOAD_BYTES {
+        return Err(HandlerError::Stdin(format!(
+            "hook payload exceeded {MAX_PAYLOAD_BYTES} bytes"
+        )));
+    }
     if buf.trim().is_empty() {
         // Treat empty stdin as "{}" so handlers fall through to their default
         // (which is typically "do nothing"). Lets the git-hook wrapper invoke
@@ -784,59 +822,9 @@ fn read_stdin_json<T: for<'de> Deserialize<'de>>() -> Result<T, HandlerError> {
     serde_json::from_str(&buf).map_err(HandlerError::from)
 }
 
-fn now_iso8601() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let (year, month, day, hour, minute, second) = epoch_to_civil(secs);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-/// Howard Hinnant's civil-from-days. Pure integer arithmetic. Variable names
-/// (`z`, `era`, `doe`, `yoe`, `doy`, `mp`) follow the canonical paper so the
-/// algorithm is recognisable; the names are intentionally short and similar.
-#[allow(clippy::similar_names, clippy::many_single_char_names)]
-fn epoch_to_civil(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
-    let day_secs = 86_400_u64;
-    let z = i64::try_from(secs / day_secs).unwrap_or(0) + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = u64::try_from(z - era * 146_097).unwrap_or(0);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = i32::try_from(yoe).unwrap_or(0) + i32::try_from(era).unwrap_or(0) * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-    let month = u32::try_from(m).unwrap_or(0);
-    let day = u32::try_from(d).unwrap_or(0);
-    let day_secs_offset = secs % day_secs;
-    let hour = u32::try_from(day_secs_offset / 3600).unwrap_or(0);
-    let minute = u32::try_from((day_secs_offset % 3600) / 60).unwrap_or(0);
-    let second = u32::try_from(day_secs_offset % 60).unwrap_or(0);
-    (year, month, day, hour, minute, second)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn iso8601_format_is_parseable() {
-        let s = now_iso8601();
-        assert!(s.ends_with('Z'));
-        assert_eq!(s.len(), 20);
-    }
-
-    #[test]
-    fn epoch_to_civil_handles_known_values() {
-        // 1970-01-01T00:00:00Z
-        assert_eq!(epoch_to_civil(0), (1970, 1, 1, 0, 0, 0));
-        // 2024-01-01T00:00:00Z = 1_704_067_200
-        assert_eq!(epoch_to_civil(1_704_067_200), (2024, 1, 1, 0, 0, 0));
-        // 2026-04-28T12:34:56Z = 1_777_379_696
-        assert_eq!(epoch_to_civil(1_777_379_696), (2026, 4, 28, 12, 34, 56));
-    }
 
     #[test]
     fn prov_private_first_line_only() {
@@ -926,6 +914,41 @@ mod tests {
         assert_eq!(lines[0].line_no, 1);
         assert_eq!(lines[0].content, "alpha");
         assert_eq!(lines[2].line_no, 3);
+    }
+
+    #[test]
+    fn parse_unified_diff_keeps_added_lines_starting_with_plus_plus_plus() {
+        // A captured diff that itself contains lines starting with `+++` or
+        // `---` (e.g., an embedded diff snippet, or a Markdown horizontal rule)
+        // must NOT be mis-classified as a header and dropped.
+        let raw = "diff --git a/notes.md b/notes.md\n\
+                   --- a/notes.md\n\
+                   +++ b/notes.md\n\
+                   @@ -0,0 +1,3 @@\n\
+                   ++++hi\n\
+                   +---hello\n\
+                   +regular\n";
+        let map = parse_unified_diff_added(raw);
+        let lines = map.get("notes.md").unwrap();
+        assert_eq!(lines.len(), 3);
+        // Strips exactly one `+` (the diff marker); the body's `+++hi` /
+        // `---hello` payload is preserved.
+        assert_eq!(lines[0].content, "+++hi");
+        assert_eq!(lines[1].content, "---hello");
+        assert_eq!(lines[2].content, "regular");
+    }
+
+    #[test]
+    fn is_diff_header_distinguishes_headers_from_content() {
+        assert!(is_diff_header("+++ b/src/lib.rs"));
+        assert!(is_diff_header("--- a/src/lib.rs"));
+        assert!(is_diff_header("+++ /dev/null"));
+        assert!(is_diff_header("--- /dev/null"));
+        // Content lines whose body starts with the marker characters but no
+        // separating space — must NOT be treated as headers.
+        assert!(!is_diff_header("+++hi"));
+        assert!(!is_diff_header("---"));
+        assert!(!is_diff_header("+++"));
     }
 
     #[test]

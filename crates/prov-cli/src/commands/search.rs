@@ -18,6 +18,9 @@ const DEFAULT_LIMIT: u32 = 50;
 pub struct Args {
     /// Search query (matched against prompt text via `SQLite` FTS5).
     pub query: String,
+    /// Maximum number of hits to return.
+    #[arg(long, default_value_t = DEFAULT_LIMIT)]
+    pub limit: u32,
     /// Emit JSON instead of human-readable output.
     #[arg(long)]
     pub json: bool,
@@ -27,12 +30,25 @@ pub struct Args {
 pub fn run(args: Args) -> anyhow::Result<()> {
     let handles = RepoHandles::open()?;
     let escaped = escape_fts(&args.query);
-    let hits = handles.cache.search_prompts(&escaped, DEFAULT_LIMIT)?;
+    // Fetch one extra so we can detect whether more results were available
+    // beyond the user's requested limit without paying for a separate COUNT.
+    let probe_limit = args.limit.saturating_add(1);
+    let mut hits = handles.cache.search_prompts(&escaped, probe_limit)?;
+    let limit_usize = args.limit as usize;
+    let truncated = hits.len() > limit_usize;
+    if truncated {
+        hits.truncate(limit_usize);
+    }
 
     if args.json {
+        let total_matched = u32::try_from(hits.len()).unwrap_or(u32::MAX);
         let payload = SearchJson {
             query: args.query.clone(),
             hits: hits.iter().map(SearchHitJson::from).collect(),
+            total_matched,
+            limit: args.limit,
+            truncated,
+            prov_version: env!("CARGO_PKG_VERSION"),
         };
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if hits.is_empty() {
@@ -49,6 +65,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 h.file
             );
             println!("    {}", h.prompt);
+        }
+        if truncated {
+            println!(
+                "(showing first {} match(es); pass --limit to see more)",
+                args.limit
+            );
         }
     }
     Ok(())
@@ -71,6 +93,14 @@ fn short_sha(sha: &str) -> &str {
 struct SearchJson {
     query: String,
     hits: Vec<SearchHitJson>,
+    /// Number of hits in this response (≤ `limit`).
+    total_matched: u32,
+    /// Limit applied to this query.
+    limit: u32,
+    /// True when more matches existed beyond `limit`.
+    truncated: bool,
+    /// Prov version that generated the envelope (for downstream version pinning).
+    prov_version: &'static str,
 }
 
 #[derive(Serialize)]

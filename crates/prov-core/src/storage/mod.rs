@@ -14,7 +14,7 @@ pub mod staging;
 /// Default git ref where prov stores public (push-eligible) notes.
 pub const NOTES_REF_PUBLIC: &str = "refs/notes/prompts";
 
-/// Git ref where prov stores opt-out private notes. `prov install` does NOT
-/// add this ref to remote refspecs; the pre-push hook double-checks and blocks
-/// any manual attempt to push it.
-pub const NOTES_REF_PRIVATE: &str = "refs/notes/prompts-private";
+// The opt-out private notes ref will live at `refs/notes/prompts-private`
+// once U7/U8 ship the routing + pre-push gate. Keeping the literal off the
+// public surface until then so a stray import doesn't accidentally try to
+// push it. See: docs/plans/.../v1-plan.md (U7, U8).

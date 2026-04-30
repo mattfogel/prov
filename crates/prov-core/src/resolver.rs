@@ -207,7 +207,8 @@ pub enum ResolveResult {
         /// AI-on-AI / backfill provenance link.
         derived_from: Option<DerivedFrom>,
         /// Git blob SHA of the AI's original output (for `prov regenerate` diff).
-        original_blob_sha: String,
+        /// `None` when the originating note did not record one.
+        original_blob_sha: Option<String>,
         /// Author who last touched the drifted line, per blame.
         blame_author_after: String,
         /// Commit blame attributed the line to.
@@ -370,12 +371,12 @@ mod tests {
             file: file.into(),
             line_range: [start, start + len - 1],
             content_hashes: hashes,
-            original_blob_sha: "deadbeef".into(),
+            original_blob_sha: Some("deadbeef".into()),
             prompt: "demo prompt".into(),
             conversation_id: "sess_test".into(),
             turn_index: 0,
             tool_use_id: Some("toolu_t".into()),
-            preceding_turns_summary: String::new(),
+            preceding_turns_summary: None,
             model: "claude-sonnet-4-5".into(),
             tool: "claude-code".into(),
             timestamp: "2026-04-28T00:00:00Z".into(),

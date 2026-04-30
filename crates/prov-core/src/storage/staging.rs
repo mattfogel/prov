@@ -419,14 +419,38 @@ fn io(path: &Path, e: &std::io::Error) -> StagingError {
 #[cfg(unix)]
 fn ensure_dir_0700(path: &Path) -> Result<(), StagingError> {
     use std::os::unix::fs::DirBuilderExt;
-    if path.exists() {
-        return Ok(());
+    // Use `symlink_metadata` so a symlinked staging dir is rejected rather
+    // than silently followed. A pre-planted symlink could otherwise redirect
+    // mode-0700 writes onto a world-readable directory the attacker controls.
+    match fs::symlink_metadata(path) {
+        Ok(md) => {
+            if md.file_type().is_symlink() {
+                return Err(StagingError::Io {
+                    path: path.to_path_buf(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "refusing to operate through a symlink",
+                    ),
+                });
+            }
+            if !md.is_dir() {
+                return Err(StagingError::Io {
+                    path: path.to_path_buf(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "path exists and is not a directory",
+                    ),
+                });
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .map_err(|e| io(path, &e)),
+        Err(e) => Err(io(path, &e)),
     }
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-        .map_err(|e| io(path, &e))
 }
 
 #[cfg(not(unix))]
@@ -445,6 +469,7 @@ fn write_0600(path: &Path, bytes: &[u8]) -> Result<(), StagingError> {
         .create(true)
         .truncate(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|e| io(path, &e))?;
     f.write_all(bytes).map_err(|e| io(path, &e))
@@ -468,6 +493,7 @@ fn append_0600(path: &Path, bytes: &[u8]) -> Result<(), StagingError> {
         .append(true)
         .create(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|e| io(path, &e))?;
     f.write_all(bytes).map_err(|e| io(path, &e))
