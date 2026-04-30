@@ -12,10 +12,21 @@ use std::sync::OnceLock;
 pub enum DetectorKind {
     /// AWS access key (`AKIA...` / `ASIA...`).
     AwsKey,
-    /// Stripe API key (`sk_live_...` / `sk_test_...`).
+    /// Stripe API key (`sk_live_...` / `sk_test_...`) and restricted/test variants.
     StripeKey,
-    /// GitHub personal access token (`ghp_...` / `github_pat_...`).
+    /// Stripe webhook signing secret (`whsec_...`).
+    StripeWebhook,
+    /// GitHub personal access token (`ghp_...` / `github_pat_...`) plus the
+    /// OAuth/server family (`gho_`, `ghu_`, `ghs_`, `ghr_`).
     GithubPat,
+    /// Anthropic API key (`sk-ant-api...` / `sk-ant-admin...`).
+    AnthropicKey,
+    /// OpenAI API key (`sk-...` with optional `proj-`/`svcacct-`/`admin-` prefix).
+    OpenAiKey,
+    /// Slack token family (`xoxa-` / `xoxb-` / `xoxp-` / `xoxr-` / `xoxs-`).
+    SlackToken,
+    /// Google API key (`AIza...`).
+    GoogleApiKey,
     /// JSON Web Token (header.payload.signature).
     Jwt,
     /// GCP service-account JSON blob.
@@ -24,6 +35,9 @@ pub enum DetectorKind {
     PemPrivateKey,
     /// Database URL with embedded credentials.
     DbUrl,
+    /// `KEY=value` / `KEY: value` shaped credential leak whose value would
+    /// otherwise slip past the entropy gate (short tokens, dictionary words).
+    KeyValueSecret,
     /// Email address.
     Email,
     /// High-entropy unknown string (Shannon entropy ≥ 4.0 over ≥ 24 chars).
@@ -39,11 +53,17 @@ impl DetectorKind {
         match self {
             Self::AwsKey => "aws-key".into(),
             Self::StripeKey => "stripe-key".into(),
+            Self::StripeWebhook => "stripe-webhook".into(),
             Self::GithubPat => "github-pat".into(),
+            Self::AnthropicKey => "anthropic-key".into(),
+            Self::OpenAiKey => "openai-key".into(),
+            Self::SlackToken => "slack-token".into(),
+            Self::GoogleApiKey => "google-api-key".into(),
             Self::Jwt => "jwt".into(),
             Self::GcpServiceAccount => "gcp-service-account".into(),
             Self::PemPrivateKey => "pem-private-key".into(),
             Self::DbUrl => "db-url".into(),
+            Self::KeyValueSecret => "key-value-secret".into(),
             Self::Email => "email".into(),
             Self::HighEntropy => "high-entropy".into(),
             Self::ProvIgnoreRule(i) => format!("provignore-rule:{i}"),
@@ -71,6 +91,12 @@ pub trait Detector: Send + Sync {
 /// Ordering matters: more-specific detectors (JWT, PEM, GCP-JSON) run before
 /// generic ones (DB-URL, email) so a JWT containing what looks like a `.` doesn't
 /// get partially redacted by the email detector.
+///
+/// Anthropic and OpenAI run BEFORE Stripe because Anthropic's `sk-ant-...` and
+/// OpenAI's `sk-...` (dash, not underscore) would otherwise be over-matched by
+/// the more generic Stripe rule if it were widened. Today Stripe uses `_` as a
+/// separator and the others use `-`, but ordering keeps the labels accurate as
+/// each provider's format evolves.
 #[must_use]
 pub fn built_in_detectors(redact_emails: bool) -> Vec<Box<dyn Detector>> {
     let mut detectors: Vec<Box<dyn Detector>> = vec![
@@ -79,12 +105,32 @@ pub fn built_in_detectors(redact_emails: bool) -> Vec<Box<dyn Detector>> {
             re: aws_re(),
         }),
         Box::new(RegexDetector {
+            kind: DetectorKind::AnthropicKey,
+            re: anthropic_re(),
+        }),
+        Box::new(RegexDetector {
+            kind: DetectorKind::OpenAiKey,
+            re: openai_re(),
+        }),
+        Box::new(RegexDetector {
+            kind: DetectorKind::StripeWebhook,
+            re: stripe_webhook_re(),
+        }),
+        Box::new(RegexDetector {
             kind: DetectorKind::StripeKey,
             re: stripe_re(),
         }),
         Box::new(RegexDetector {
             kind: DetectorKind::GithubPat,
             re: github_pat_re(),
+        }),
+        Box::new(RegexDetector {
+            kind: DetectorKind::SlackToken,
+            re: slack_re(),
+        }),
+        Box::new(RegexDetector {
+            kind: DetectorKind::GoogleApiKey,
+            re: google_api_re(),
         }),
         Box::new(RegexDetector {
             kind: DetectorKind::Jwt,
@@ -96,6 +142,7 @@ pub fn built_in_detectors(redact_emails: bool) -> Vec<Box<dyn Detector>> {
             kind: DetectorKind::DbUrl,
             re: db_url_re(),
         }),
+        Box::new(KeyValueSecretDetector),
     ];
     if redact_emails {
         detectors.push(Box::new(RegexDetector {
@@ -182,6 +229,51 @@ impl Detector for GcpServiceAccountDetector {
     }
 }
 
+/// `KEY=value` / `KEY: value` detector for short or low-entropy secrets that
+/// would otherwise bypass the entropy gate (e.g., `password=hunter2`,
+/// `API_TOKEN=abc123`). Only redacts the value half so the user can still see
+/// which key was leaked.
+struct KeyValueSecretDetector;
+
+impl Detector for KeyValueSecretDetector {
+    fn scan(&self, input: &str) -> Vec<DetectedSpan> {
+        let re = key_value_secret_re();
+        let mut out = Vec::new();
+        for caps in re.captures_iter(input) {
+            // The named `value` group is the half we redact; the key half
+            // (and the `=`/`:` separator) stay in the output.
+            if let Some(value) = caps.name("value") {
+                let v = value.as_str();
+                // Skip values an earlier detector already replaced. Without
+                // this guard we would double-mark `key=[REDACTED:openai-key]`
+                // as `key=[REDACTED:key-value-secret]`.
+                if v.starts_with("[REDACTED:") {
+                    continue;
+                }
+                out.push(DetectedSpan {
+                    kind: DetectorKind::KeyValueSecret,
+                    span: (value.start(), value.end()),
+                });
+            }
+        }
+        out
+    }
+}
+
+fn key_value_secret_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    // Match a credential-shaped key followed by `=` or `:` then non-whitespace
+    // value (capped at 256 chars to avoid eating across statements). The value
+    // group is the only thing redacted; `[REDACTED:key-value-secret]` lands in
+    // the value's bytes, leaving the key/separator visible.
+    R.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b(?:api[_-]?key|secret|password|passwd|token|auth|credential)\s*[:=]\s*(?P<value>[^\s"',]{1,256})"#,
+        )
+        .unwrap()
+    })
+}
+
 fn balanced_brace_end(s: &str) -> Option<usize> {
     let mut depth = 0_i32;
     for (i, ch) in s.char_indices() {
@@ -265,15 +357,54 @@ fn aws_re() -> &'static Regex {
 
 fn stripe_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"\bsk_(?:live|test)_[0-9a-zA-Z]{24,}\b").unwrap())
+    // Broadened to include restricted-key prefix `rk_` alongside `sk_`. Both
+    // come in `live` and `test` flavors with the same 24+ char body.
+    R.get_or_init(|| Regex::new(r"\b(?:sk|rk)_(?:live|test)_[0-9a-zA-Z]{24,}\b").unwrap())
+}
+
+fn stripe_webhook_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\bwhsec_[0-9a-zA-Z]{32,}\b").unwrap())
 }
 
 fn github_pat_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    // ghp_ tokens are 40 chars total ("ghp_" + 36); github_pat_ is much longer.
+    // ghp_/gho_/ghu_/ghs_/ghr_ tokens (PAT, OAuth, user-server, server, refresh)
+    // are 40 chars total ("ghX_" + 36); `github_pat_` fine-grained tokens are
+    // much longer (≥ 60 chars after the prefix).
     R.get_or_init(|| {
-        Regex::new(r"\b(?:ghp_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{60,})\b").unwrap()
+        Regex::new(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{60,})\b").unwrap()
     })
+}
+
+fn anthropic_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r"\bsk-ant-(?:api|admin)\d{2,}-[A-Za-z0-9_-]{32,}\b").unwrap()
+    })
+}
+
+fn openai_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    // OpenAI tokens use `-` as a separator (vs. Stripe's `_`), with optional
+    // project/service-account/admin prefixes. Run before Stripe so the more
+    // specific shape wins on labelling.
+    R.get_or_init(|| {
+        Regex::new(r"\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}\b").unwrap()
+    })
+}
+
+fn slack_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    // Slack bot tokens have 3 numeric/id segments before the body
+    // (`xoxb-T...-B...-secret`); some user/admin variants have 4. Accept
+    // either shape, and a body of mixed alphanumerics (not just hex).
+    R.get_or_init(|| Regex::new(r"\bxox[abprs]-\d+-\d+(?:-\d+)?-[A-Za-z0-9]+\b").unwrap())
+}
+
+fn google_api_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\bAIza[A-Za-z0-9_-]{35}\b").unwrap())
 }
 
 fn jwt_re() -> &'static Regex {
@@ -431,6 +562,98 @@ mod tests {
         // 16-char alphanumeric that isn't AKIA/ASIA-prefixed.
         let hits = scan_with_first_detector(&DetectorKind::AwsKey, "ZZZAIOSFODNN7EXAMPLE");
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn anthropic_api_key_matches() {
+        let hits = scan_with_first_detector(
+            &DetectorKind::AnthropicKey,
+            "Authorization: Bearer sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789_-aB here",
+        );
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn anthropic_admin_key_matches() {
+        let hits = scan_with_first_detector(
+            &DetectorKind::AnthropicKey,
+            "ANTHROPIC_ADMIN_KEY=sk-ant-admin01-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-Z",
+        );
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn slack_bot_token_matches() {
+        let hits = scan_with_first_detector(
+            &DetectorKind::SlackToken,
+            "slack: xoxb-1234567890-9876543210-abcdef0123456789abcdef0123456789",
+        );
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn google_api_key_matches() {
+        // Real Google API keys are AIza + exactly 35 chars from [A-Za-z0-9_-].
+        let hits = scan_with_first_detector(
+            &DetectorKind::GoogleApiKey,
+            "key=AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY end",
+        );
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn stripe_restricted_key_matches() {
+        let hits = scan_with_first_detector(
+            &DetectorKind::StripeKey,
+            "set rk_live_4eC39HqLyjWDarjtT1zdp7dc and friends",
+        );
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn stripe_webhook_secret_matches() {
+        let hits = scan_with_first_detector(
+            &DetectorKind::StripeWebhook,
+            "STRIPE_WEBHOOK=whsec_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789",
+        );
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn key_value_secret_redacts_short_value() {
+        // `password=hunter2` should be caught even though "hunter2" has low
+        // entropy and would slip past `high_entropy_scan`.
+        let hits = KeyValueSecretDetector.scan("password=hunter2 and more");
+        assert_eq!(hits.len(), 1);
+        let (s, e) = hits[0].span;
+        // Only the value half is in the span; the `password=` prefix stays
+        // visible.
+        assert_eq!(&"password=hunter2 and more"[s..e], "hunter2");
+    }
+
+    #[test]
+    fn key_value_secret_redacts_with_colon_separator() {
+        let hits = KeyValueSecretDetector.scan("API_KEY: secret_value_here ");
+        assert_eq!(hits.len(), 1);
+        let (s, e) = hits[0].span;
+        assert_eq!(&"API_KEY: secret_value_here "[s..e], "secret_value_here");
+    }
+
+    #[test]
+    fn key_value_secret_does_not_match_unrelated_text() {
+        // A `password` mention without a key/value separator must not trigger.
+        let hits = KeyValueSecretDetector.scan("we should reset the password later");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn github_oauth_token_matches() {
+        // gho_ tokens (OAuth user-to-server) follow the same shape as ghp_.
+        let hits = scan_with_first_detector(
+            &DetectorKind::GithubPat,
+            "gho_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]
