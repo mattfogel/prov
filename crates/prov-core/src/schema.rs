@@ -78,7 +78,10 @@ pub struct Edit {
     pub content_hashes: Vec<String>,
     /// Git blob SHA of the AI's full original output (stored separately as a git
     /// blob so `prov regenerate` can diff the regenerated text against the original).
-    pub original_blob_sha: String,
+    /// Optional: U3's capture pipeline stages edits before a blob exists, and
+    /// older notes did not always carry one. Absent on serialize when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_blob_sha: Option<String>,
     /// The user prompt that produced this edit (post-redaction).
     pub prompt: String,
     /// Stable Claude Code session id for the conversation this edit came from.
@@ -92,7 +95,11 @@ pub struct Edit {
     pub tool_use_id: Option<String>,
     /// Short summary of the prior conversation context (post-redaction). Excludes
     /// turns marked `# prov:private` so private content never leaks via summary.
-    pub preceding_turns_summary: String,
+    /// Optional because v1 capture does not yet emit summaries; older notes that
+    /// stored an empty string deserialize as `Some("")`, which downstream code
+    /// treats identically to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preceding_turns_summary: Option<String>,
     /// Model name as captured at session start (e.g., "claude-sonnet-4-5").
     pub model: String,
     /// Tool that produced the edit; "claude-code" in v1.
@@ -111,6 +118,10 @@ pub struct Edit {
 /// than captured live." Downstream rendering surfaces these differently — backfill
 /// notes carry an `(approximate)` marker, rewrites surface a "previous prompt"
 /// expand link.
+///
+/// The `Unknown` catch-all variant lets v1.x readers tolerate v1.y notes that
+/// add new derivation kinds — they parse cleanly and are treated as "no
+/// derivation link known to this build" rather than rejected.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DerivedFrom {
@@ -128,6 +139,12 @@ pub enum DerivedFrom {
         /// Path of the transcript file the match came from.
         transcript_path: String,
     },
+    /// Forward-compatible catch-all: a future v1.y release may add new kinds
+    /// (e.g., `merge`, `revert`). Older builds parse those as `Unknown` rather
+    /// than failing — the resolver / log render then treat them as "no
+    /// derivation".
+    #[serde(other)]
+    Unknown,
 }
 
 /// Errors raised by schema parsing.
@@ -156,12 +173,14 @@ mod tests {
             file: "src/auth.ts".into(),
             line_range: [42, 44],
             content_hashes: vec!["a1b2c3".into(), "d4e5f6".into(), "g7h8i9".into()],
-            original_blob_sha: "deadbeefcafe".into(),
+            original_blob_sha: Some("deadbeefcafe".into()),
             prompt: "make this faster but readable".into(),
             conversation_id: "sess_abc123".into(),
             turn_index: 3,
             tool_use_id: Some("toolu_01abc".into()),
-            preceding_turns_summary: "Refactor of auth; previously discussed rate limiting.".into(),
+            preceding_turns_summary: Some(
+                "Refactor of auth; previously discussed rate limiting.".into(),
+            ),
             model: "claude-sonnet-4-5".into(),
             tool: "claude-code".into(),
             timestamp: "2026-04-28T11:32:00Z".into(),
@@ -223,6 +242,26 @@ mod tests {
     }
 
     #[test]
+    fn derived_from_unknown_kind_parses_as_unknown() {
+        // A v1.y reader sees a v1.x note with a `kind` it doesn't recognize.
+        // The catch-all `Unknown` variant lets it deserialize without error.
+        let edit_json = r#"{
+            "file": "x.rs",
+            "line_range": [1, 1],
+            "content_hashes": ["a"],
+            "prompt": "p",
+            "conversation_id": "s",
+            "turn_index": 0,
+            "model": "m",
+            "tool": "claude-code",
+            "timestamp": "2026-04-28T00:00:00Z",
+            "derived_from": { "kind": "future_kind", "extra": "ignored" }
+        }"#;
+        let parsed: Edit = serde_json::from_str(edit_json).unwrap();
+        assert_eq!(parsed.derived_from, Some(DerivedFrom::Unknown));
+    }
+
+    #[test]
     fn derived_from_backfill_roundtrips() {
         let mut edit = sample_edit();
         edit.derived_from = Some(DerivedFrom::Backfill {
@@ -256,5 +295,28 @@ mod tests {
         let n = Note::from_json(json).unwrap();
         assert!(n.edits[0].tool_use_id.is_none());
         assert!(n.edits[0].derived_from.is_none());
+    }
+
+    #[test]
+    fn missing_optional_blob_sha_and_summary_parses() {
+        // Capture-side notes (U3) and `prov backfill` outputs may not stamp
+        // either field; deserialization populates them as `None`.
+        let json = r#"{
+            "version": 1,
+            "edits": [{
+                "file": "x.rs",
+                "line_range": [1, 1],
+                "content_hashes": ["a"],
+                "prompt": "p",
+                "conversation_id": "s",
+                "turn_index": 0,
+                "model": "m",
+                "tool": "claude-code",
+                "timestamp": "2026-04-28T00:00:00Z"
+            }]
+        }"#;
+        let n = Note::from_json(json).unwrap();
+        assert!(n.edits[0].original_blob_sha.is_none());
+        assert!(n.edits[0].preceding_turns_summary.is_none());
     }
 }

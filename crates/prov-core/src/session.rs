@@ -1,12 +1,13 @@
-//! Session and turn identifiers used across the capture pipeline.
+//! Session identifier used across the capture pipeline.
 //!
 //! `SessionId` is the stable Claude Code conversation id surfaced on every hook
 //! payload. We treat it as an opaque string but constrain its lexical shape so
 //! it can safely be used as a directory name under `.git/prov-staging/`.
 //!
-//! `TurnIndex` is the zero-based count of `UserPromptSubmit` events seen for
-//! the session. It pairs with `SessionId` as the deduplication key for
-//! notes-merge resolution (U10).
+//! Turn indices are kept as raw `u32` rather than a newtype — every consumer
+//! reaches for the underlying integer immediately (file naming, comparison).
+//! When U10 grows turn semantics that warrant a richer type, reintroduce the
+//! newtype here.
 
 use std::fmt;
 
@@ -73,31 +74,6 @@ impl AsRef<str> for SessionId {
     }
 }
 
-/// Zero-based turn index within a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct TurnIndex(pub u32);
-
-impl TurnIndex {
-    /// Construct from a raw `u32`.
-    #[must_use]
-    pub const fn new(n: u32) -> Self {
-        Self(n)
-    }
-
-    /// Underlying `u32`.
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
-
-impl fmt::Display for TurnIndex {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 /// Errors raised by `SessionId::parse`.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SessionIdError {
@@ -158,13 +134,6 @@ mod tests {
             SessionId::parse("a\\b"),
             Err(SessionIdError::InvalidChar('\\'))
         ));
-    }
-
-    #[test]
-    fn turn_index_roundtrip() {
-        let t = TurnIndex::new(7);
-        assert_eq!(t.get(), 7);
-        assert_eq!(t.to_string(), "7");
     }
 
     #[test]
