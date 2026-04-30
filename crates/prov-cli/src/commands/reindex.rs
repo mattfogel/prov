@@ -17,6 +17,7 @@ pub struct Args {
     pub json: bool,
 }
 
+#[allow(clippy::needless_pass_by_value)]
 pub fn run(args: Args) -> anyhow::Result<()> {
     let mut handles = RepoHandles::open()?;
     let stats = handles.cache.reindex_from(&handles.notes)?;

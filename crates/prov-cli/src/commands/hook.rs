@@ -254,7 +254,10 @@ fn most_recent_turn_started_at(
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(s) = name.to_str() else { continue };
-        let Some(num) = s.strip_prefix("turn-").and_then(|s| s.strip_suffix(".json")) else {
+        let Some(num) = s
+            .strip_prefix("turn-")
+            .and_then(|s| s.strip_suffix(".json"))
+        else {
             continue;
         };
         let Ok(n) = num.parse::<u32>() else { continue };
@@ -594,9 +597,7 @@ fn match_edit_to_diff(
     if let Some(window) = added_window(added) {
         let overlap = window_overlap(captured, window);
         if captured_len > 0 && overlap * 2 >= captured_len {
-            return Some(Match {
-                line_range: window,
-            });
+            return Some(Match { line_range: window });
         }
     }
     None

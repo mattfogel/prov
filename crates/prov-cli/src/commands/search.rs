@@ -34,9 +34,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // beyond the user's requested limit without paying for a separate COUNT.
     let probe_limit = args.limit.saturating_add(1);
     let mut hits = handles.cache.search_prompts(&escaped, probe_limit)?;
-    let truncated = hits.len() as u32 > args.limit;
+    let limit_usize = args.limit as usize;
+    let truncated = hits.len() > limit_usize;
     if truncated {
-        hits.truncate(args.limit as usize);
+        hits.truncate(limit_usize);
     }
 
     if args.json {

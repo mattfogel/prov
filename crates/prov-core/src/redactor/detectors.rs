@@ -379,9 +379,7 @@ fn github_pat_re() -> &'static Regex {
 
 fn anthropic_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| {
-        Regex::new(r"\bsk-ant-(?:api|admin)\d{2,}-[A-Za-z0-9_-]{32,}\b").unwrap()
-    })
+    R.get_or_init(|| Regex::new(r"\bsk-ant-(?:api|admin)\d{2,}-[A-Za-z0-9_-]{32,}\b").unwrap())
 }
 
 fn openai_re() -> &'static Regex {
@@ -389,9 +387,7 @@ fn openai_re() -> &'static Regex {
     // OpenAI tokens use `-` as a separator (vs. Stripe's `_`), with optional
     // project/service-account/admin prefixes. Run before Stripe so the more
     // specific shape wins on labelling.
-    R.get_or_init(|| {
-        Regex::new(r"\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}\b").unwrap()
-    })
+    R.get_or_init(|| Regex::new(r"\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}\b").unwrap())
 }
 
 fn slack_re() -> &'static Regex {

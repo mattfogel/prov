@@ -300,13 +300,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         f.sync_all()
             .with_context(|| format!("fsync {}", tmp_path.display()))?;
     }
-    fs::rename(&tmp_path, path).with_context(|| {
-        format!(
-            "renaming {} → {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("renaming {} → {}", tmp_path.display(), path.display()))?;
     Ok(())
 }
 

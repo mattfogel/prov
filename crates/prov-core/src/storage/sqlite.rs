@@ -347,10 +347,12 @@ fn check_schema_version(conn: &Connection) -> Result<(), CacheError> {
     let Some(stored) = stored else {
         return Ok(());
     };
-    let stored_n: u32 = stored.parse().map_err(|_| CacheError::SchemaVersionMismatch {
-        stored: 0,
-        expected: CACHE_SCHEMA_VERSION,
-    })?;
+    let stored_n: u32 = stored
+        .parse()
+        .map_err(|_| CacheError::SchemaVersionMismatch {
+            stored: 0,
+            expected: CACHE_SCHEMA_VERSION,
+        })?;
     if stored_n == CACHE_SCHEMA_VERSION {
         Ok(())
     } else {
