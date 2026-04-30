@@ -25,9 +25,14 @@ pub struct Cache {
 impl Cache {
     /// Open or create the cache file at the given path. Initializes the schema
     /// on first use; subsequent opens are cheap.
+    ///
+    /// Refuses to open caches stamped with a `cache_schema_version` other than
+    /// the version this build supports. Callers (`prov reindex`) handle the
+    /// `SchemaVersionMismatch` variant by suggesting a rebuild.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, CacheError> {
         let conn = Connection::open(path).map_err(CacheError::from)?;
         Self::init(&conn)?;
+        check_schema_version(&conn)?;
         Ok(Self { conn })
     }
 
@@ -35,6 +40,7 @@ impl Cache {
     pub fn open_in_memory() -> Result<Self, CacheError> {
         let conn = Connection::open_in_memory().map_err(CacheError::from)?;
         Self::init(&conn)?;
+        check_schema_version(&conn)?;
         Ok(Self { conn })
     }
 
@@ -42,6 +48,7 @@ impl Cache {
         conn.execute_batch(
             r"
             PRAGMA journal_mode = WAL;
+            PRAGMA busy_timeout = 5000;
             PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
 
@@ -112,6 +119,7 @@ impl Cache {
         Ok(v)
     }
 
+    #[cfg(test)]
     fn set_recorded_notes_ref_sha(&self, sha: Option<&str>) -> Result<(), CacheError> {
         match sha {
             Some(s) => {
@@ -134,7 +142,16 @@ impl Cache {
     /// Drop and rebuild every table from the given `NotesStore`. After this,
     /// `recorded_notes_ref_sha` matches the store's `ref_sha` so subsequent
     /// reads can detect drift.
+    ///
+    /// All writes — including the `cache_meta.notes_ref_sha` stamp — commit
+    /// inside a single transaction. If anything fails the cache is rolled back
+    /// to its prior state rather than left half-rebuilt with a stale SHA.
     pub fn reindex_from(&mut self, store: &NotesStore) -> Result<ReindexStats, CacheError> {
+        // Capture the live ref SHA before opening the transaction so the SHA
+        // stamp inside the tx reflects the state we actually rebuilt from.
+        let ref_sha = store.ref_sha()?;
+        let entries = store.list().map_err(CacheError::from)?;
+
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM notes", [])?;
         // edits and content_hashes cascade via FK from notes deletion.
@@ -142,7 +159,6 @@ impl Cache {
         // use the FTS5 `delete-all` command, then re-populate from new edits below.
         tx.execute("INSERT INTO edits_fts(edits_fts) VALUES('delete-all')", [])?;
 
-        let entries = store.list().map_err(CacheError::from)?;
         let mut note_count = 0_u32;
         let mut edit_count = 0_u32;
         let now = unix_now();
@@ -193,10 +209,11 @@ impl Cache {
                 }
             }
         }
-        tx.commit()?;
 
-        let ref_sha = store.ref_sha()?;
-        self.set_recorded_notes_ref_sha(ref_sha.as_deref())?;
+        // Stamp the SHA in the same transaction so a failure rolls back the
+        // entire reindex (rather than leaving rebuilt rows under a stale SHA).
+        write_recorded_notes_ref_sha_tx(&tx, ref_sha.as_deref())?;
+        tx.commit()?;
 
         Ok(ReindexStats {
             notes: note_count,
@@ -316,6 +333,59 @@ fn u32_from_i64(v: i64) -> u32 {
     v as u32
 }
 
+/// Read the stored `cache_schema_version` and reject if it does not match this
+/// build's `CACHE_SCHEMA_VERSION`. A missing row (fresh DB; `init` only stamps
+/// it via `INSERT OR IGNORE`) is treated as the current version.
+fn check_schema_version(conn: &Connection) -> Result<(), CacheError> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM cache_meta WHERE key = 'cache_schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(stored) = stored else {
+        return Ok(());
+    };
+    let stored_n: u32 = stored.parse().map_err(|_| CacheError::SchemaVersionMismatch {
+        stored: 0,
+        expected: CACHE_SCHEMA_VERSION,
+    })?;
+    if stored_n == CACHE_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(CacheError::SchemaVersionMismatch {
+            stored: stored_n,
+            expected: CACHE_SCHEMA_VERSION,
+        })
+    }
+}
+
+/// Upsert (or delete) `cache_meta.notes_ref_sha`, bound to an open
+/// `Transaction` so the SHA stamp commits or rolls back atomically with the
+/// reindex writes.
+fn write_recorded_notes_ref_sha_tx(
+    tx: &rusqlite::Transaction<'_>,
+    sha: Option<&str>,
+) -> Result<(), CacheError> {
+    match sha {
+        Some(s) => {
+            tx.execute(
+                "INSERT INTO cache_meta(key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![CACHE_META_NOTES_REF_SHA, s],
+            )?;
+        }
+        None => {
+            tx.execute(
+                "DELETE FROM cache_meta WHERE key = ?1",
+                params![CACHE_META_NOTES_REF_SHA],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn unix_now() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
@@ -336,6 +406,15 @@ pub enum CacheError {
     /// Note schema parsing error.
     #[error(transparent)]
     Schema(#[from] SchemaError),
+    /// Stored cache schema version does not match this build of prov. Callers
+    /// should drop the cache file and run `prov reindex` to rebuild.
+    #[error("cache schema version mismatch: stored v{stored}, this build of prov supports v{expected}; run `prov reindex` to rebuild")]
+    SchemaVersionMismatch {
+        /// Version recorded in `cache_meta.cache_schema_version`.
+        stored: u32,
+        /// Version the running build expects.
+        expected: u32,
+    },
 }
 
 impl From<rusqlite::Error> for CacheError {
