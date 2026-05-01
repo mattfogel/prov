@@ -169,7 +169,9 @@ fn upsert_note_inserts_single_note_with_search_indexable_prompt() {
         20,
     )]);
 
-    cache.upsert_note("abc123", &note, Some("ref_sha_1")).unwrap();
+    cache
+        .upsert_note("abc123", &note, Some("ref_sha_1"))
+        .unwrap();
 
     assert_eq!(cache.note_count().unwrap(), 1);
     let cached = cache.get_note("abc123").unwrap().expect("cached");
@@ -240,7 +242,10 @@ fn upsert_note_leaves_other_commits_untouched() {
     assert_eq!(cache.note_count().unwrap(), 2);
     assert_eq!(cache.search_prompts("beta", 10).unwrap().len(), 1);
     assert!(cache.search_prompts("alpha prompt", 10).unwrap().is_empty());
-    assert_eq!(cache.search_prompts("alpha rewritten", 10).unwrap().len(), 1);
+    assert_eq!(
+        cache.search_prompts("alpha rewritten", 10).unwrap().len(),
+        1
+    );
 }
 
 #[test]

@@ -249,8 +249,7 @@ impl Cache {
         // edits, retract them from the FTS index, then drop the underlying
         // `notes` row (FK cascade clears `edits` and `content_hashes`).
         {
-            let mut stmt =
-                tx.prepare("SELECT rowid, prompt FROM edits WHERE commit_sha = ?1")?;
+            let mut stmt = tx.prepare("SELECT rowid, prompt FROM edits WHERE commit_sha = ?1")?;
             let mut rows = stmt.query(params![commit_sha])?;
             while let Some(row) = rows.next()? {
                 let rowid: i64 = row.get(0)?;
