@@ -29,7 +29,7 @@ use serde_json::{Map, Value};
 
 use prov_core::git::Git;
 use prov_core::storage::sqlite::Cache;
-use prov_core::storage::{notes::NotesStore, NOTES_REF_PUBLIC};
+use prov_core::storage::{notes::NotesStore, NOTES_REF_PRIVATE, NOTES_REF_PUBLIC};
 
 use super::common::CACHE_FILENAME;
 
@@ -329,8 +329,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 fn initialize_cache(git: &Git, cache_path: &Path) -> anyhow::Result<()> {
     let mut cache =
         Cache::open(cache_path).with_context(|| format!("opening {}", cache_path.display()))?;
-    let store = NotesStore::new(git.clone(), NOTES_REF_PUBLIC);
-    let _stats = cache.reindex_from(&store)?;
+    let public = NotesStore::new(git.clone(), NOTES_REF_PUBLIC);
+    let private = NotesStore::new(git.clone(), NOTES_REF_PRIVATE);
+    let _ = cache.reindex_from(&public)?;
+    let _ = cache.overlay_from(&private)?;
     Ok(())
 }
 

@@ -34,7 +34,7 @@ use prov_core::session::SessionId;
 use prov_core::storage::notes::NotesStore;
 use prov_core::storage::sqlite::Cache;
 use prov_core::storage::staging::{EditRecord, SessionMeta, Staging, StagingError, TurnRecord};
-use prov_core::storage::NOTES_REF_PUBLIC;
+use prov_core::storage::{NOTES_REF_PRIVATE, NOTES_REF_PUBLIC};
 
 use super::common::CACHE_FILENAME;
 use prov_core::time::now_iso8601;
@@ -512,12 +512,90 @@ fn handle_post_commit(git: &Git, staging: &Staging) -> Result<(), HandlerError> 
     let added_by_file = collect_added_lines(git, &head)?;
 
     let sessions = staging.list_sessions().unwrap_or_default();
-    let mut matched_edits: Vec<Edit> = Vec::new();
-    // (session, file, line-range) tuple uniquely identifying each matched
-    // edit so the cleanup pass below can count which sessions are fully done.
-    let mut matched_keys: Vec<(SessionId, String, [u32; 2])> = Vec::new();
+    // Public and private staged edits flush to separate notes refs (the latter
+    // is local-only and never reaches a remote). Run the matcher twice — once
+    // per visibility — so a session that interleaves public and private turns
+    // routes each batch to the correct ref.
+    let public_matched = flush_visibility(
+        git,
+        staging,
+        &sessions,
+        &added_by_file,
+        cherry_pick_source.as_deref(),
+        false,
+    );
+    let private_matched = flush_visibility(
+        git,
+        staging,
+        &sessions,
+        &added_by_file,
+        cherry_pick_source.as_deref(),
+        true,
+    );
 
+    if !public_matched.edits.is_empty() {
+        write_note_and_cache(
+            git,
+            staging,
+            &head,
+            public_matched.edits,
+            NOTES_REF_PUBLIC,
+            /* stamp_ref_sha = */ true,
+        );
+    }
+    if !private_matched.edits.is_empty() {
+        write_note_and_cache(
+            git,
+            staging,
+            &head,
+            private_matched.edits,
+            NOTES_REF_PRIVATE,
+            /* stamp_ref_sha = */ false,
+        );
+    }
+
+    // Cleanup: a session is fully done only when both public and private
+    // staging trees have no unmatched edits left. Removing the session dir
+    // earlier would lose any private edits still waiting on a future commit.
     for sid in &sessions {
+        let pub_total = staging.read_edits(sid, false).unwrap_or_default().len();
+        let priv_total = staging.read_edits(sid, true).unwrap_or_default().len();
+        let pub_matched = public_matched
+            .keys
+            .iter()
+            .filter(|(s, _, _)| s == sid)
+            .count();
+        let priv_matched = private_matched
+            .keys
+            .iter()
+            .filter(|(s, _, _)| s == sid)
+            .count();
+        let total = pub_total + priv_total;
+        if total > 0 && (pub_matched + priv_matched) == total {
+            staging.remove_session(sid).ok();
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct VisibilityMatches {
+    edits: Vec<Edit>,
+    /// (session, file, line-range) tuples for cleanup accounting.
+    keys: Vec<(SessionId, String, [u32; 2])>,
+}
+
+fn flush_visibility(
+    git: &Git,
+    staging: &Staging,
+    sessions: &[SessionId],
+    added_by_file: &std::collections::HashMap<String, Vec<AddedLine>>,
+    cherry_pick_source: Option<&str>,
+    private: bool,
+) -> VisibilityMatches {
+    let mut out = VisibilityMatches::default();
+    for sid in sessions {
         let session_meta = staging
             .read_session_meta(sid)
             .ok()
@@ -527,12 +605,10 @@ fn handle_post_commit(git: &Git, staging: &Staging) -> Result<(), HandlerError> 
                 model: "unknown".into(),
                 started_at: String::new(),
             });
-        let turns = staging.read_turns(sid, false).unwrap_or_default();
-        let edits = staging.read_edits(sid, false).unwrap_or_default();
-
+        let turns = staging.read_turns(sid, private).unwrap_or_default();
+        let edits = staging.read_edits(sid, private).unwrap_or_default();
         for er in &edits {
-            let Some(matched) = match_edit_to_diff(er, &added_by_file, Some(git.work_tree()))
-            else {
+            let Some(matched) = match_edit_to_diff(er, added_by_file, Some(git.work_tree())) else {
                 continue;
             };
             let prompt = turns
@@ -540,8 +616,7 @@ fn handle_post_commit(git: &Git, staging: &Staging) -> Result<(), HandlerError> 
                 .find(|t| t.turn_index == er.turn_index)
                 .map(|t| t.prompt.clone())
                 .unwrap_or_default();
-
-            matched_edits.push(Edit {
+            let mut edit = Edit {
                 file: matched.file.clone(),
                 line_range: matched.line_range,
                 content_hashes: er.content_hashes.clone(),
@@ -555,76 +630,74 @@ fn handle_post_commit(git: &Git, staging: &Staging) -> Result<(), HandlerError> 
                 tool: "claude-code".into(),
                 timestamp: er.timestamp.clone(),
                 derived_from: None,
-            });
-            matched_keys.push((sid.clone(), er.file.clone(), matched.line_range));
-        }
-    }
-
-    if !matched_edits.is_empty() {
-        let mut note = Note::new(matched_edits);
-        // Cherry-pick: stamp every matched edit with `derived_from: Rewrite`
-        // pointing back to the source commit. v1 keeps this coarse; U9 owns
-        // the precise per-edit `source_edit` index pinning.
-        if let Some(source) = &cherry_pick_source {
-            for edit in &mut note.edits {
+            };
+            // Cherry-pick: stamp every matched edit with `derived_from: Rewrite`
+            // pointing back to the source commit. v1 keeps this coarse; U9 owns
+            // the precise per-edit `source_edit` index pinning.
+            if let Some(source) = cherry_pick_source {
                 edit.derived_from = Some(DerivedFrom::Rewrite {
-                    source_commit: source.clone(),
+                    source_commit: source.to_string(),
                     source_edit: 0,
                 });
             }
+            out.edits.push(edit);
+            out.keys
+                .push((sid.clone(), er.file.clone(), matched.line_range));
         }
-        let store = NotesStore::new(git.clone(), NOTES_REF_PUBLIC);
-        if let Err(e) = store.write(&head, &note) {
+    }
+    out
+}
+
+/// Write `edits` as a note attached to `head` on `ref_name`, then update the
+/// SQLite cache. Cache failures are logged and swallowed — the post-commit
+/// hook must never propagate errors out (`prov reindex` recovers cache state).
+fn write_note_and_cache(
+    git: &Git,
+    staging: &Staging,
+    head: &str,
+    edits: Vec<Edit>,
+    ref_name: &str,
+    stamp_ref_sha: bool,
+) {
+    let note = Note::new(edits);
+    let store = NotesStore::new(git.clone(), ref_name);
+    if let Err(e) = store.write(head, &note) {
+        staging
+            .append_log(&format!(
+                "{}: notes.write({ref_name}) failed: {e}",
+                now_iso8601()
+            ))
+            .ok();
+        return;
+    }
+
+    let cache_path = git.git_dir().join(CACHE_FILENAME);
+    if !cache_path.exists() {
+        return;
+    }
+    let mut cache = match Cache::open(&cache_path) {
+        Ok(c) => c,
+        Err(e) => {
             staging
-                .append_log(&format!("{}: notes.write failed: {e}", now_iso8601()))
+                .append_log(&format!("{}: cache.open failed: {e}", now_iso8601()))
                 .ok();
-            return Ok(());
+            return;
         }
-
-        // Refresh the SQLite cache so cache-keyed reads (`prov log <file>`,
-        // `prov search`) see the new note immediately. Without this the user
-        // has to run `prov reindex` between every commit and `prov log`,
-        // defeating R3's warm-cache promise.
-        //
-        // Defensive contract applies: we don't propagate errors out of the
-        // post-commit handler. If the cache file is missing (uninstalled or
-        // never initialized) or the upsert fails, log to staging and exit
-        // 0 — the note is already safely on the notes ref, and a future
-        // `prov reindex` recovers the cache state.
-        let cache_path = git.git_dir().join(CACHE_FILENAME);
-        if cache_path.exists() {
-            match Cache::open(&cache_path) {
-                Ok(mut cache) => {
-                    let new_ref_sha = store.ref_sha().ok().flatten();
-                    if let Err(e) = cache.upsert_note(&head, &note, new_ref_sha.as_deref()) {
-                        staging
-                            .append_log(&format!(
-                                "{}: cache.upsert_note failed: {e}",
-                                now_iso8601()
-                            ))
-                            .ok();
-                    }
-                }
-                Err(e) => {
-                    staging
-                        .append_log(&format!("{}: cache.open failed: {e}", now_iso8601()))
-                        .ok();
-                }
-            }
-        }
+    };
+    let result = if stamp_ref_sha {
+        let new_ref_sha = store.ref_sha().ok().flatten();
+        cache.upsert_note(head, &note, new_ref_sha.as_deref())
+    } else {
+        cache.upsert_note_no_stamp(head, &note)
+    };
+    if let Err(e) = result {
+        staging
+            .append_log(&format!(
+                "{}: cache.upsert_note({ref_name}) failed: {e}",
+                now_iso8601()
+            ))
+            .ok();
     }
-
-    // Cleanup: if every staged edit in a session matched, remove the session
-    // dir. Partial-match cleanup (rewriting edits.jsonl) is U9-territory.
-    for sid in &sessions {
-        let still = staging.read_edits(sid, false).unwrap_or_default();
-        let matched_in_session = matched_keys.iter().filter(|(s, _, _)| s == sid).count();
-        if !still.is_empty() && matched_in_session == still.len() {
-            staging.remove_session(sid).ok();
-        }
-    }
-
-    Ok(())
 }
 
 #[derive(Debug)]

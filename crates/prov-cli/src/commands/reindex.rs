@@ -20,23 +20,25 @@ pub struct Args {
 #[allow(clippy::needless_pass_by_value)]
 pub fn run(args: Args) -> anyhow::Result<()> {
     let mut handles = RepoHandles::open()?;
-    let stats = handles.cache.reindex_from(&handles.notes)?;
+    let public_stats = handles.cache.reindex_from(&handles.notes)?;
+    // Layer private notes on top so local reads see them without pushing.
+    let private_stats = handles.cache.overlay_from(&handles.private_notes)?;
+    let total_notes = public_stats.notes + private_stats.notes;
+    let total_edits = public_stats.edits + private_stats.edits;
 
     if args.json {
         let payload = ReindexJson {
-            notes: stats.notes,
-            edits: stats.edits,
+            notes: total_notes,
+            edits: total_edits,
             cache_path: handles.cache_path.display().to_string(),
             prov_version: env!("CARGO_PKG_VERSION"),
         };
         println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else if stats.notes == 0 {
+    } else if total_notes == 0 {
         println!("no notes to index");
     } else {
         println!(
-            "reindexed {} note(s), {} edit(s) into {}",
-            stats.notes,
-            stats.edits,
+            "reindexed {total_notes} note(s), {total_edits} edit(s) into {}",
             handles.cache_path.display()
         );
     }
