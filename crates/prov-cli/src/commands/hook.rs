@@ -187,10 +187,7 @@ struct PostToolUsePayload {
     tool_response: serde_json::Value,
 }
 
-fn handle_post_tool_use(
-    staging: &Staging,
-    work_tree: Option<&Path>,
-) -> Result<(), HandlerError> {
+fn handle_post_tool_use(staging: &Staging, work_tree: Option<&Path>) -> Result<(), HandlerError> {
     let payload: PostToolUsePayload = read_stdin_json()?;
     let raw_session = payload.session_id.unwrap_or_default();
     let Ok(sid) = SessionId::parse(raw_session) else {

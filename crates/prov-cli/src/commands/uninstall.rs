@@ -21,9 +21,7 @@ use serde_json::{Map, Value};
 use prov_core::git::Git;
 
 use super::common::CACHE_FILENAME;
-use super::install::{
-    claude_settings_path, is_prov_owned_entry, HOOK_BLOCK_BEGIN, HOOK_BLOCK_END,
-};
+use super::install::{claude_settings_path, is_prov_owned_entry, HOOK_BLOCK_BEGIN, HOOK_BLOCK_END};
 
 #[derive(Parser, Debug)]
 pub struct Args {

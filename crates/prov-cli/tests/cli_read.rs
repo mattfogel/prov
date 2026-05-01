@@ -237,7 +237,11 @@ fn install_heals_legacy_top_level_command_shape() {
     let raw = std::fs::read_to_string(&settings_path).unwrap();
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     let stop_arr = v["hooks"]["Stop"].as_array().unwrap();
-    assert_eq!(stop_arr.len(), 1, "legacy prov entry should be replaced, not duplicated");
+    assert_eq!(
+        stop_arr.len(),
+        1,
+        "legacy prov entry should be replaced, not duplicated"
+    );
     assert!(
         stop_arr[0]["command"].is_null(),
         "post-heal entry must not carry top-level `command`: {stop_arr:?}"
