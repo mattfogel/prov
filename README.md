@@ -52,6 +52,12 @@ By default, notes stay on your machine. To share with your team:
 prov sync enable origin              # opt in to push/fetch for this repo
 ```
 
+## Contributing
+
+Run `./scripts/check.sh` before opening a PR — it mirrors CI (build, test,
+`cargo fmt --check`, `cargo clippy -D warnings`) so a clean local run
+gives high confidence the PR will go green.
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) **OR** [Apache-2.0](LICENSE-APACHE) at your option, matching Rust ecosystem convention.
