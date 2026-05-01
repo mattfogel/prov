@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "edits": [
+    {
+      "file": "scripts/check.sh",
+      "line_range": [
+        1,
+        31
+      ],
+      "content_hashes": [
+        "11fbe13cce6b2fc7d5f20364d788a45d5595b8e9467814f4db1de94a9a8f8080",
+        "e09cd140bfe3451dd48daffd4af847f077164de8e3036ed2c86bf70280b6b53f",
+        "cbdc1f3486a5a5da24e83130b39601f743f91e298ccf245b0ff857611d4a6d8f",
+        "75a5e564d49702064543f10b83df42ebd96ff0157c2baf5fa042ef79ba6f9dd1",
+        "287e9f3c3f43fdc82b324e8406812203e778918bd80adf7eea5ea8f03e92f254",
+        "9ec0893c9d14b74e27bee30a1c68ad1b733bcf9a43bda97571057a51757545f5",
+        "9041270302586dfe1c002e46ed80e6242758c9aa3cb438273150a2d716e8bf05",
+        "71c2da85dbcc1b10481a13ff810d4af055a144af8e079f9b6fbbe4238d6ca617",
+        "2bc7d5cd588fbdad610c44a7ab454e5a1a5e8251d95c877ffc52b473e60678ff",
+        "0ade1d16281ebe4d8217f15bfa195c5227edfc6683204583ca779a1e2bffce6c",
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "47a71423b5aaab69d34335e4204fa8238ac44a4de9baef877a482106b004c4a6",
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "d335b89eae54a5d21b880571e44b3074627a969f71c55168d37a2cc063406ff6",
+        "33ec46b4d9b3b118ac41244310342f40f55d98fee9092f42cbc658f881644448",
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "20d78015f6f5622f1c9b528a877f80d82f411c2eef45d04e535c16ffe3fd1bcd",
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "a0ce57fa34e46f61d7dcbd41447da028adbeeccccdcaf7af860cc0a3ea8b57f5",
+        "ecb1f893297e9dd13129a76fbe3030d1cb9a785d06f16586b6201c7047394a15",
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "bd4e2b1d3f602da455637e1412d09aa7befbbfadc0eff4d2af7487a60691e8a2",
+        "31272cb75df6e6cf1cda41b0f5984b24d25e598daf8b79addc398e778ace5d44",
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "a773bb0765e0595ff1cf557e02d4d47782d899f1a9e9d8fb6ef3acdcbe234f08",
+        "90b431533a7e9d54cf580a3a593928de6ce6b86bd36a8fc711fc8921aaa6f702",
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "f2c512e0fbfc26a71dd517142a92036a88bda47d7d5b9c430c926f483e4d49de",
+        "2e962f41a70ce37e551e126461d98e36cbab95467260c1140d2a0267cfe66cac",
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "296c60182739daaab9c8f1f1b8ed67abe8715cfed89b85edf6531461c6fb2e6c",
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+      ],
+      "prompt": "how about A plus a line in CLAUDE.md telling you to run check.sh before creating a PR? that way it's not on every push, but at the end of each big task",
+      "conversation_id": "77fceb14-459c-4b7f-a957-986326bdc353",
+      "turn_index": 13,
+      "tool_use_id": "toolu_01XqVxbqVSXK9Mdzo6DE8Q48",
+      "model": "unknown",
+      "tool": "claude-code",
+      "timestamp": "2026-05-01T17:38:44Z"
+    },
+    {
+      "file": "CLAUDE.md",
+      "line_range": [
+        1,
+        15
+      ],
+      "content_hashes": [
+        "b85578c54c2493ef620a7779f051dc62d6d8aaf913863704e92e52091f111aaa",
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "24f4d1abe603861bbe1e39e6ce403599ac161752a4ec984d179ab48f90f76e50",
+        "2dcbfae3a605d5dd89c5370cb2483ec5a00feb07eb6fa942aa48462849b27d29",
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "a072d46bbb3cc0a698f75fb1f03ad3450c8b297553954dd2785894b66043a792",
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "ee90c64ccefd2ec56df5d71fd8fd766bc0f9dc9e7d7f16c959570f2633b14985",
+        "9647d7174275530c9420c726cf02dfc614865ebd1e3b0c04a2df7fcdad1d7572",
+        "a51b6d2fa4bf0fc8dc3283298a40397152950870e7572ec861fbc0586b7b37bc",
+        "6e385d7403e3477bbf6d684d463f32efd30422da43ec16f3e3c36e5eb89d0946",
+        "48d9dd648c2d0dcf72d311b192fc3476e4dc317e414c7c8bc22a7f6f9fc7fe6f",
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "9aae144ed3d5628168c2f888c9e40c8f513cc00cf08a6ae1161cb5d2a067fc13",
+        "d2e0c97cc053b61a433c89ce7f6d72c4d9ec5cb0bcad9f671f7cf392d491d97c",
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+      ],
+      "prompt": "how about A plus a line in CLAUDE.md telling you to run check.sh before creating a PR? that way it's not on every push, but at the end of each big task",
+      "conversation_id": "77fceb14-459c-4b7f-a957-986326bdc353",
+      "turn_index": 13,
+      "tool_use_id": "toolu_01JciwTgwDrknychHK6fuLEf",
+      "model": "unknown",
+      "tool": "claude-code",
+      "timestamp": "2026-05-01T17:39:10Z"
+    }
+  ]
+}
