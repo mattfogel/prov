@@ -14,15 +14,15 @@
 //! before staging. Even local-only staging is scrubbed: a future opt-in
 //! `prov push` should never find raw secrets in the staging tree.
 //!
-//! Empirical risk note (per the v1 plan, "Open Questions → Deferred to
-//! Implementation"): the exact shape of `tool_response.structuredPatch` is not
-//! formally documented. The parsers below operate on the documented
-//! `tool_input` envelope (Edit/Write/MultiEdit shapes per the Claude Code
-//! tool docs). A live-session verification step is tracked as a follow-up
-//! after U3 lands.
+//! The parsers below operate on the documented `tool_input` envelope
+//! (Edit/Write/MultiEdit shapes per the Claude Code tool docs). Live-session
+//! payloads were diffed against the fixtures and matched; the
+//! `tool_response.structuredPatch` shape is still unparsed in v1 (we don't
+//! need it — `tool_input` carries enough), so its undocumented status doesn't
+//! gate capture today.
 
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
@@ -82,7 +82,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let result = match args.event {
         Event::UserPromptSubmit => handle_user_prompt_submit(&staging),
-        Event::PostToolUse => handle_post_tool_use(&staging),
+        Event::PostToolUse => handle_post_tool_use(&staging, Some(git.work_tree())),
         Event::Stop => handle_stop(&staging),
         Event::SessionStart => handle_session_start(&staging),
         Event::PostCommit => handle_post_commit(&git, &staging),
@@ -187,7 +187,10 @@ struct PostToolUsePayload {
     tool_response: serde_json::Value,
 }
 
-fn handle_post_tool_use(staging: &Staging) -> Result<(), HandlerError> {
+fn handle_post_tool_use(
+    staging: &Staging,
+    work_tree: Option<&Path>,
+) -> Result<(), HandlerError> {
     let payload: PostToolUsePayload = read_stdin_json()?;
     let raw_session = payload.session_id.unwrap_or_default();
     let Ok(sid) = SessionId::parse(raw_session) else {
@@ -205,9 +208,6 @@ fn handle_post_tool_use(staging: &Staging) -> Result<(), HandlerError> {
         .unwrap_or(0)
         .saturating_sub(1);
 
-    // TODO(U3-empirical): verify against a live Claude Code session that
-    // `tool_use_id` is consistently present and that the tool_input shapes
-    // below match live payloads. The unit tests use synthesized fixtures.
     let edits = decompose_tool_use(
         &tool_name,
         &payload.tool_input,
@@ -215,6 +215,7 @@ fn handle_post_tool_use(staging: &Staging) -> Result<(), HandlerError> {
         &sid,
         turn_index,
         payload.tool_use_id.as_deref(),
+        work_tree,
     );
 
     for edit in edits {
@@ -291,6 +292,7 @@ fn decompose_tool_use(
     sid: &SessionId,
     turn_index: u32,
     tool_use_id: Option<&str>,
+    work_tree: Option<&Path>,
 ) -> Vec<EditRecord> {
     let timestamp = now_iso8601();
     match tool_name {
@@ -315,6 +317,7 @@ fn decompose_tool_use(
                 old,
                 new,
                 &timestamp,
+                work_tree,
             )]
         }
         "Write" => {
@@ -334,6 +337,7 @@ fn decompose_tool_use(
                 "",
                 content,
                 &timestamp,
+                work_tree,
             )]
         }
         "MultiEdit" => {
@@ -357,6 +361,7 @@ fn decompose_tool_use(
                         old,
                         new,
                         &timestamp,
+                        work_tree,
                     )
                 })
                 .collect()
@@ -375,6 +380,7 @@ fn record_for(
     before: &str,
     after: &str,
     timestamp: &str,
+    work_tree: Option<&Path>,
 ) -> EditRecord {
     let after_lines: Vec<&str> = after.split('\n').collect();
     let line_count = u32::try_from(after_lines.len()).unwrap_or(u32::MAX);
@@ -391,13 +397,43 @@ fn record_for(
         turn_index,
         tool_name: tool_name.to_string(),
         tool_use_id: tool_use_id.map(str::to_string),
-        file: file.to_string(),
+        file: relativize_for_storage(file, work_tree),
         line_range,
         before: before.to_string(),
         after: after.to_string(),
         content_hashes,
         timestamp: timestamp.to_string(),
     }
+}
+
+/// Convert Claude Code's absolute `file_path` to a path relative to the work
+/// tree. Storing relative paths means the staged record's `file` field matches
+/// `git diff` output directly (which always emits paths relative to the
+/// repo root) and is portable across machines with different repo locations.
+///
+/// Falls back to the input string when the path is already relative, lies
+/// outside the work tree, or no work tree was provided (test paths).
+fn relativize_for_storage(file: &str, work_tree: Option<&Path>) -> String {
+    let p = Path::new(file);
+    if !p.is_absolute() {
+        return file.to_string();
+    }
+    let Some(wt) = work_tree else {
+        return file.to_string();
+    };
+    if let Ok(rel) = p.strip_prefix(wt) {
+        return rel.to_string_lossy().into_owned();
+    }
+    // Fallback: symlinks can put the captured `file_path` and the work tree
+    // in different forms (notably macOS `/var` → `/private/var`, which trips
+    // up TempDir-based tests, and could hit users whose repos live behind a
+    // symlinked mount). Canonicalize both sides before giving up.
+    if let (Ok(file_canon), Ok(wt_canon)) = (p.canonicalize(), wt.canonicalize()) {
+        if let Ok(rel) = file_canon.strip_prefix(&wt_canon) {
+            return rel.to_string_lossy().into_owned();
+        }
+    }
+    file.to_string()
 }
 
 // =================================================================
@@ -495,7 +531,8 @@ fn handle_post_commit(git: &Git, staging: &Staging) -> Result<(), HandlerError> 
         let edits = staging.read_edits(sid, false).unwrap_or_default();
 
         for er in &edits {
-            let Some(matched) = match_edit_to_diff(er, &added_by_file) else {
+            let Some(matched) = match_edit_to_diff(er, &added_by_file, Some(git.work_tree()))
+            else {
                 continue;
             };
             let prompt = turns
@@ -505,7 +542,7 @@ fn handle_post_commit(git: &Git, staging: &Staging) -> Result<(), HandlerError> 
                 .unwrap_or_default();
 
             matched_edits.push(Edit {
-                file: er.file.clone(),
+                file: matched.file.clone(),
                 line_range: matched.line_range,
                 content_hashes: er.content_hashes.clone(),
                 original_blob_sha: None,
@@ -560,14 +597,25 @@ fn handle_post_commit(git: &Git, staging: &Staging) -> Result<(), HandlerError> 
 
 #[derive(Debug)]
 struct Match {
+    /// File path as it appears in `git diff` (relative to the work tree). The
+    /// Edit stored in the note carries this normalized form so the resolver
+    /// and CLI consumers compare paths consistently regardless of whether
+    /// the original staged record used an absolute or relative path.
+    file: String,
     line_range: [u32; 2],
 }
 
 fn match_edit_to_diff(
     er: &EditRecord,
     added_by_file: &std::collections::HashMap<String, Vec<AddedLine>>,
+    work_tree: Option<&Path>,
 ) -> Option<Match> {
-    let added = added_by_file.get(&er.file)?;
+    // Normalize the staged path to the same shape `git diff` emits. Required
+    // because Claude Code's tool_input passes absolute paths (we relativize at
+    // staging time, but pre-fix data may still be absolute) while the diff
+    // output is always relative to the repo root.
+    let key = relativize_for_storage(&er.file, work_tree);
+    let added = added_by_file.get(&key)?;
     if added.is_empty() {
         return None;
     }
@@ -577,7 +625,10 @@ fn match_edit_to_diff(
     let added_content: Vec<String> = added.iter().map(|l| l.content.clone()).collect();
     let after_lines: Vec<&str> = er.after.split('\n').collect();
     if let Some(range) = exact_window_match_str(&after_lines, &added_content, added) {
-        return Some(Match { line_range: range });
+        return Some(Match {
+            file: key,
+            line_range: range,
+        });
     }
 
     // Strategy b: normalized — strip trailing whitespace, collapse internal
@@ -586,7 +637,10 @@ fn match_edit_to_diff(
     let norm_after: Vec<String> = after_lines.iter().map(|l| normalize(l)).collect();
     let norm_added: Vec<String> = added_content.iter().map(|l| normalize(l)).collect();
     if let Some(range) = exact_window_match_norm(&norm_after, &norm_added, added) {
-        return Some(Match { line_range: range });
+        return Some(Match {
+            file: key,
+            line_range: range,
+        });
     }
 
     // Strategy c: line-range proximity — capture's `[start, end]` overlaps
@@ -597,7 +651,10 @@ fn match_edit_to_diff(
     if let Some(window) = added_window(added) {
         let overlap = window_overlap(captured, window);
         if captured_len > 0 && overlap * 2 >= captured_len {
-            return Some(Match { line_range: window });
+            return Some(Match {
+                file: key,
+                line_range: window,
+            });
         }
     }
     None
@@ -854,11 +911,62 @@ mod tests {
             &sid,
             0,
             Some("toolu_1"),
+            None,
         );
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].tool_name, "Edit");
         assert_eq!(recs[0].file, "src/lib.rs");
         assert_eq!(recs[0].after, "new");
+    }
+
+    #[test]
+    fn decompose_relativizes_absolute_file_path_under_work_tree() {
+        // Real Claude Code passes absolute file paths in tool_input. Storing
+        // them verbatim made matching against `git diff` (which uses paths
+        // relative to the repo root) miss every time. Staging records must
+        // hold the relative form.
+        let sid = SessionId::parse("sess_t").unwrap();
+        let work_tree = Path::new("/tmp/repo");
+        let input = serde_json::json!({
+            "file_path": "/tmp/repo/src/lib.rs",
+            "old_string": "old",
+            "new_string": "new",
+        });
+        let recs = decompose_tool_use(
+            "Edit",
+            &input,
+            &serde_json::Value::Null,
+            &sid,
+            0,
+            Some("toolu_1"),
+            Some(work_tree),
+        );
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].file, "src/lib.rs");
+    }
+
+    #[test]
+    fn decompose_keeps_absolute_path_outside_work_tree() {
+        // Defensive: an edit to a file outside the repo (rare, but possible
+        // via tool misuse) shouldn't get silently rewritten into a confusing
+        // pseudo-relative path.
+        let sid = SessionId::parse("sess_t").unwrap();
+        let work_tree = Path::new("/tmp/repo");
+        let input = serde_json::json!({
+            "file_path": "/etc/hosts",
+            "content": "anything",
+        });
+        let recs = decompose_tool_use(
+            "Write",
+            &input,
+            &serde_json::Value::Null,
+            &sid,
+            0,
+            None,
+            Some(work_tree),
+        );
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].file, "/etc/hosts");
     }
 
     #[test]
@@ -879,6 +987,7 @@ mod tests {
             &sid,
             0,
             Some("toolu_1"),
+            None,
         );
         assert_eq!(recs.len(), 3);
         assert_eq!(recs[0].after, "1");
@@ -895,8 +1004,48 @@ mod tests {
             &sid,
             0,
             None,
+            None,
         );
         assert!(recs.is_empty());
+    }
+
+    #[test]
+    fn match_edit_to_diff_normalizes_legacy_absolute_paths() {
+        // Pre-fix staging records carry absolute file paths. The matcher
+        // backstop must strip the work-tree prefix before doing the diff
+        // lookup so existing data captured before the fix can still be
+        // flushed without forcing the user to re-run their session.
+        use std::collections::HashMap;
+        let work_tree = Path::new("/tmp/repo");
+        let mut added_by_file: HashMap<String, Vec<AddedLine>> = HashMap::new();
+        added_by_file.insert(
+            "src/lib.rs".to_string(),
+            vec![
+                AddedLine {
+                    line_no: 1,
+                    content: "alpha".into(),
+                },
+                AddedLine {
+                    line_no: 2,
+                    content: "beta".into(),
+                },
+            ],
+        );
+        let er = EditRecord {
+            session_id: "s".into(),
+            turn_index: 0,
+            tool_name: "Write".into(),
+            tool_use_id: None,
+            file: "/tmp/repo/src/lib.rs".into(),
+            line_range: [1, 2],
+            before: String::new(),
+            after: "alpha\nbeta\n".into(),
+            content_hashes: vec![],
+            timestamp: "2026-01-01T00:00:00Z".into(),
+        };
+        let m = match_edit_to_diff(&er, &added_by_file, Some(work_tree)).expect("match");
+        assert_eq!(m.file, "src/lib.rs");
+        assert_eq!(m.line_range, [1, 2]);
     }
 
     #[test]

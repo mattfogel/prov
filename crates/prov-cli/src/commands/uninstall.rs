@@ -21,7 +21,9 @@ use serde_json::{Map, Value};
 use prov_core::git::Git;
 
 use super::common::CACHE_FILENAME;
-use super::install::{claude_settings_path, HOOK_BLOCK_BEGIN, HOOK_BLOCK_END};
+use super::install::{
+    claude_settings_path, is_prov_owned_entry, HOOK_BLOCK_BEGIN, HOOK_BLOCK_END,
+};
 
 #[derive(Parser, Debug)]
 pub struct Args {
@@ -159,12 +161,7 @@ fn strip_prov_entries(root: &mut Map<String, Value>) -> bool {
             continue;
         };
         let before = arr.len();
-        arr.retain(|entry| {
-            !entry
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(|cmd| cmd.starts_with("prov hook"))
-        });
+        arr.retain(|entry| !is_prov_owned_entry(entry));
         if arr.len() != before {
             removed = true;
         }
@@ -269,8 +266,8 @@ mod tests {
             r#"{
                 "hooks": {
                     "PostToolUse": [
-                        {"command": "echo user"},
-                        {"command": "prov hook post-tool-use"}
+                        {"hooks": [{"type": "command", "command": "echo user"}]},
+                        {"hooks": [{"type": "command", "command": "prov hook post-tool-use"}]}
                     ]
                 }
             }"#,
@@ -280,13 +277,15 @@ mod tests {
         assert!(removed);
         let arr = root["hooks"]["PostToolUse"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["command"], "echo user");
+        assert_eq!(arr[0]["hooks"][0]["command"], "echo user");
     }
 
     #[test]
     fn strip_prov_entries_drops_empty_event_keys() {
-        let mut root: Map<String, Value> =
-            serde_json::from_str(r#"{"hooks":{"Stop":[{"command":"prov hook stop"}]}}"#).unwrap();
+        let mut root: Map<String, Value> = serde_json::from_str(
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"prov hook stop"}]}]}}"#,
+        )
+        .unwrap();
         let removed = strip_prov_entries(&mut root);
         assert!(removed);
         // Hooks object becomes empty → root drops it entirely.
@@ -295,10 +294,25 @@ mod tests {
 
     #[test]
     fn strip_prov_entries_idempotent_when_nothing_to_remove() {
-        let mut root: Map<String, Value> =
-            serde_json::from_str(r#"{"hooks":{"Stop":[{"command":"echo other"}]}}"#).unwrap();
+        let mut root: Map<String, Value> = serde_json::from_str(
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo other"}]}]}}"#,
+        )
+        .unwrap();
         let removed = strip_prov_entries(&mut root);
         assert!(!removed);
+    }
+
+    #[test]
+    fn strip_prov_entries_heals_legacy_top_level_command_shape() {
+        // A user upgrading from the broken shape we briefly shipped: prov
+        // commands lived at the entry top level, which Claude Code rejected.
+        // Re-running install (or uninstall) must clear them so the resulting
+        // settings.json validates.
+        let mut root: Map<String, Value> =
+            serde_json::from_str(r#"{"hooks":{"Stop":[{"command":"prov hook stop"}]}}"#).unwrap();
+        let removed = strip_prov_entries(&mut root);
+        assert!(removed);
+        assert!(!root.contains_key("hooks"));
     }
 
     #[test]

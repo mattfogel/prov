@@ -279,3 +279,81 @@ fn end_to_end_capture_writes_note_to_head_on_post_commit() {
         "note missing file: {body}"
     );
 }
+
+#[test]
+fn end_to_end_capture_handles_absolute_file_path_in_tool_input() {
+    // Real Claude Code passes absolute paths in `file_path`. Earlier the
+    // matcher keyed on those absolute paths and `git diff` keyed on relative
+    // paths, so nothing matched and post-commit silently produced no note.
+    // Mirror the live shape exactly.
+    let tmp = init_repo();
+    let root = tmp.path();
+    let abs_file = root.join("src/lib.rs");
+
+    fire_hook(root, "session-start", &read_fixture("session-start.json"));
+    fire_hook(
+        root,
+        "user-prompt-submit",
+        &read_fixture("user-prompt-submit.json"),
+    );
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        &abs_file,
+        "pub fn hello() -> &'static str {\n    \"hello, prov\"\n}\n",
+    )
+    .unwrap();
+
+    let payload = serde_json::json!({
+        "session_id": SID,
+        "tool_name": "Write",
+        "tool_use_id": "toolu_abs",
+        "tool_input": {
+            "file_path": abs_file.to_string_lossy(),
+            "content": "pub fn hello() -> &'static str {\n    \"hello, prov\"\n}\n",
+        },
+        "tool_response": {},
+    })
+    .to_string();
+    fire_hook(root, "post-tool-use", &payload);
+    fire_hook(root, "stop", &read_fixture("stop.json"));
+
+    run_git(root, &["add", "src/lib.rs"]);
+    run_git(root, &["commit", "-q", "-m", "feat: hello"]);
+    fire_hook(root, "post-commit", "");
+
+    let head = String::from_utf8(
+        Command::new("git")
+            .current_dir(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let show = Command::new("git")
+        .current_dir(root)
+        .args(["notes", "--ref", "refs/notes/prompts", "show", &head])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(
+        show.status.success(),
+        "no note attached to HEAD: stderr={}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let body = String::from_utf8(show.stdout).unwrap();
+    // Note's `file` must be the relative path even though tool_input was absolute.
+    assert!(
+        body.contains("\"file\": \"src/lib.rs\""),
+        "note should store relative file path: {body}"
+    );
+    assert!(
+        !body.contains(&abs_file.to_string_lossy().to_string()),
+        "note must not leak the absolute path: {body}"
+    );
+}
