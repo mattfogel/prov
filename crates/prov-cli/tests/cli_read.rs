@@ -94,13 +94,41 @@ fn install_in_fresh_repo_writes_hooks_settings_and_cache() {
     assert!(hook.contains("prov hook post-commit"));
     assert!(hook.contains("# <<< prov"));
 
-    // .claude/settings.json contains all four hook events.
+    // .claude/settings.json contains all four hook events, each emitted in
+    // Claude Code's required entry shape: `{ matcher?, hooks: [{type, command,
+    // timeout?}] }`. The earlier shape (top-level `command` on the entry)
+    // parsed as JSON but was rejected by Claude Code at session start.
     let settings = std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&settings).unwrap();
     for event in ["UserPromptSubmit", "PostToolUse", "Stop", "SessionStart"] {
+        let arr = v["hooks"][event]
+            .as_array()
+            .unwrap_or_else(|| panic!("settings.json missing event {event}: {settings}"));
+        let prov_block = arr
+            .iter()
+            .find(|entry| {
+                entry["hooks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|h| h["command"].as_str())
+                    .any(|cmd| cmd.starts_with("prov hook"))
+            })
+            .unwrap_or_else(|| panic!("no prov-owned block for {event}: {settings}"));
+        // Top-level `command` would fail Claude Code's schema validation.
         assert!(
-            settings.contains(event),
-            "settings.json missing event {event}: {settings}"
+            prov_block["command"].is_null(),
+            "prov entry for {event} must not carry top-level `command`: {prov_block}"
         );
+        let inner = prov_block["hooks"]
+            .as_array()
+            .unwrap_or_else(|| panic!("prov entry for {event} missing inner `hooks` array"));
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner[0]["type"], "command");
+        assert!(inner[0]["command"]
+            .as_str()
+            .unwrap()
+            .starts_with("prov hook"));
     }
 
     // git config keys are set.
@@ -158,9 +186,12 @@ fn install_preserves_user_claude_settings_keys() {
     let tmp = init_repo();
     let settings_path = tmp.path().join(".claude/settings.json");
     std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    // Pre-existing user content uses Claude Code's schema (matcher? + hooks
+    // array). Install must preserve unrelated top-level keys, leave the user's
+    // hook block alone, and append its own prov-owned block alongside.
     std::fs::write(
         &settings_path,
-        r#"{"theme":"dark","hooks":{"Stop":[{"command":"echo user"}]}}"#,
+        r#"{"theme":"dark","hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo user"}]}]}}"#,
     )
     .unwrap();
 
@@ -170,8 +201,52 @@ fn install_preserves_user_claude_settings_keys() {
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(v["theme"], "dark");
     let stop_arr = v["hooks"]["Stop"].as_array().unwrap();
-    assert!(stop_arr.iter().any(|e| e["command"] == "echo user"));
-    assert!(stop_arr.iter().any(|e| e["command"] == "prov hook stop"));
+    let entry_commands = |e: &serde_json::Value| -> Vec<String> {
+        e["hooks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|h| h["command"].as_str().map(str::to_owned))
+            .collect()
+    };
+    assert!(stop_arr
+        .iter()
+        .any(|e| entry_commands(e).iter().any(|c| c == "echo user")));
+    assert!(stop_arr
+        .iter()
+        .any(|e| entry_commands(e).iter().any(|c| c == "prov hook stop")));
+}
+
+#[test]
+fn install_heals_legacy_top_level_command_shape() {
+    // A previous prov build wrote prov hooks with `command` at the entry top
+    // level; Claude Code rejected the resulting settings.json on load. A
+    // re-install must replace those legacy entries with the schema-correct
+    // shape rather than appending alongside them.
+    let tmp = init_repo();
+    let settings_path = tmp.path().join(".claude/settings.json");
+    std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings_path,
+        r#"{"hooks":{"Stop":[{"command":"prov hook stop","timeout":5}]}}"#,
+    )
+    .unwrap();
+
+    prov_in(tmp.path()).arg("install").assert().success();
+
+    let raw = std::fs::read_to_string(&settings_path).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let stop_arr = v["hooks"]["Stop"].as_array().unwrap();
+    assert_eq!(
+        stop_arr.len(),
+        1,
+        "legacy prov entry should be replaced, not duplicated"
+    );
+    assert!(
+        stop_arr[0]["command"].is_null(),
+        "post-heal entry must not carry top-level `command`: {stop_arr:?}"
+    );
+    assert_eq!(stop_arr[0]["hooks"][0]["command"], "prov hook stop");
 }
 
 #[test]

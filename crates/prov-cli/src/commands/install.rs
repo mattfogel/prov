@@ -256,14 +256,13 @@ fn install_claude_settings(git: &Git) -> anyhow::Result<()> {
             .as_array_mut()
             .ok_or_else(|| anyhow!("`hooks.{event}` in {} must be an array", path.display()))?;
 
-        // Drop any prior prov-owned entries (commands starting with `prov hook`)
-        // before re-inserting, so re-running install doesn't duplicate.
-        user_entries.retain(|entry| {
-            !entry
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(|cmd| cmd.starts_with("prov hook"))
-        });
+        // Drop any prior prov-owned entries before re-inserting, so re-running
+        // install doesn't duplicate. We match either the v1 entry shape
+        // (`entry.hooks[].command` per Claude Code's schema) or the legacy
+        // shape we shipped briefly with `command` at the entry top level — the
+        // legacy form was rejected by Claude Code at session start, so this
+        // self-heals an already-broken settings.json on re-install.
+        user_entries.retain(|entry| !is_prov_owned_entry(entry));
         for entry in plugin_entries_arr {
             user_entries.push(entry.clone());
         }
@@ -271,6 +270,26 @@ fn install_claude_settings(git: &Git) -> anyhow::Result<()> {
 
     write_pretty_json(&path, &Value::Object(root))?;
     Ok(())
+}
+
+/// True if the settings.json hook-entry block is owned by prov, in either the
+/// current Claude Code schema (commands nested under `entry.hooks[]`) or the
+/// legacy shape we briefly shipped (command at entry top level).
+pub(crate) fn is_prov_owned_entry(entry: &Value) -> bool {
+    if entry
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|cmd| cmd.starts_with("prov hook"))
+    {
+        return true;
+    }
+    entry
+        .get("hooks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|h| h.get("command").and_then(Value::as_str))
+        .any(|cmd| cmd.starts_with("prov hook"))
 }
 
 fn write_pretty_json(path: &Path, value: &Value) -> anyhow::Result<()> {
