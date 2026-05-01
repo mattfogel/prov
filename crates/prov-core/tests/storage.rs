@@ -160,6 +160,95 @@ fn reindex_clears_previous_cache_state() {
 }
 
 #[test]
+fn upsert_note_inserts_single_note_with_search_indexable_prompt() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    let note = Note::new(vec![make_edit(
+        "src/auth.ts",
+        "fix the session expiry race",
+        10,
+        20,
+    )]);
+
+    cache
+        .upsert_note("abc123", &note, Some("ref_sha_1"))
+        .unwrap();
+
+    assert_eq!(cache.note_count().unwrap(), 1);
+    let cached = cache.get_note("abc123").unwrap().expect("cached");
+    assert_eq!(cached, note);
+    let by_file = cache.edits_for_file("src/auth.ts").unwrap();
+    assert_eq!(by_file.len(), 1);
+    let hits = cache.search_prompts("session", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        cache.recorded_notes_ref_sha().unwrap().as_deref(),
+        Some("ref_sha_1")
+    );
+}
+
+#[test]
+fn upsert_note_replaces_prior_note_for_same_commit_in_fts_too() {
+    // The post-rewrite path (and an unusual re-fire of post-commit) can land
+    // a fresh note on the same SHA. The replace must clear the prior FTS
+    // rows or `prov search` will keep returning ghosts of the old prompt.
+    let mut cache = Cache::open_in_memory().unwrap();
+    let first = Note::new(vec![make_edit("a.ts", "old prompt text", 1, 1)]);
+    cache.upsert_note("sha", &first, Some("ref1")).unwrap();
+    assert_eq!(cache.search_prompts("old", 10).unwrap().len(), 1);
+
+    let second = Note::new(vec![make_edit("a.ts", "new prompt text", 1, 1)]);
+    cache.upsert_note("sha", &second, Some("ref2")).unwrap();
+
+    assert_eq!(cache.note_count().unwrap(), 1);
+    assert!(
+        cache.search_prompts("old", 10).unwrap().is_empty(),
+        "stale FTS row survived upsert"
+    );
+    let new_hits = cache.search_prompts("new", 10).unwrap();
+    assert_eq!(new_hits.len(), 1);
+    assert_eq!(
+        cache.recorded_notes_ref_sha().unwrap().as_deref(),
+        Some("ref2")
+    );
+}
+
+#[test]
+fn upsert_note_leaves_other_commits_untouched() {
+    let mut cache = Cache::open_in_memory().unwrap();
+    cache
+        .upsert_note(
+            "sha_a",
+            &Note::new(vec![make_edit("a.ts", "alpha prompt", 1, 1)]),
+            Some("ref_a"),
+        )
+        .unwrap();
+    cache
+        .upsert_note(
+            "sha_b",
+            &Note::new(vec![make_edit("b.ts", "beta prompt", 1, 1)]),
+            Some("ref_b"),
+        )
+        .unwrap();
+
+    // Re-upserting sha_a must not disturb sha_b's edits or FTS rows.
+    cache
+        .upsert_note(
+            "sha_a",
+            &Note::new(vec![make_edit("a.ts", "alpha rewritten", 1, 1)]),
+            Some("ref_a2"),
+        )
+        .unwrap();
+
+    assert_eq!(cache.note_count().unwrap(), 2);
+    assert_eq!(cache.search_prompts("beta", 10).unwrap().len(), 1);
+    assert!(cache.search_prompts("alpha prompt", 10).unwrap().is_empty());
+    assert_eq!(
+        cache.search_prompts("alpha rewritten", 10).unwrap().len(),
+        1
+    );
+}
+
+#[test]
 fn cache_get_note_returns_none_when_uncached() {
     let cache = Cache::open_in_memory().unwrap();
     assert!(cache.get_note("nonexistent").unwrap().is_none());

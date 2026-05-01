@@ -32,8 +32,11 @@ use prov_core::redactor::Redactor;
 use prov_core::schema::{DerivedFrom, Edit, Note};
 use prov_core::session::SessionId;
 use prov_core::storage::notes::NotesStore;
+use prov_core::storage::sqlite::Cache;
 use prov_core::storage::staging::{EditRecord, SessionMeta, Staging, StagingError, TurnRecord};
 use prov_core::storage::NOTES_REF_PUBLIC;
+
+use super::common::CACHE_FILENAME;
 use prov_core::time::now_iso8601;
 
 #[derive(Parser, Debug)]
@@ -576,6 +579,38 @@ fn handle_post_commit(git: &Git, staging: &Staging) -> Result<(), HandlerError> 
                 .append_log(&format!("{}: notes.write failed: {e}", now_iso8601()))
                 .ok();
             return Ok(());
+        }
+
+        // Refresh the SQLite cache so cache-keyed reads (`prov log <file>`,
+        // `prov search`) see the new note immediately. Without this the user
+        // has to run `prov reindex` between every commit and `prov log`,
+        // defeating R3's warm-cache promise.
+        //
+        // Defensive contract applies: we don't propagate errors out of the
+        // post-commit handler. If the cache file is missing (uninstalled or
+        // never initialized) or the upsert fails, log to staging and exit
+        // 0 — the note is already safely on the notes ref, and a future
+        // `prov reindex` recovers the cache state.
+        let cache_path = git.git_dir().join(CACHE_FILENAME);
+        if cache_path.exists() {
+            match Cache::open(&cache_path) {
+                Ok(mut cache) => {
+                    let new_ref_sha = store.ref_sha().ok().flatten();
+                    if let Err(e) = cache.upsert_note(&head, &note, new_ref_sha.as_deref()) {
+                        staging
+                            .append_log(&format!(
+                                "{}: cache.upsert_note failed: {e}",
+                                now_iso8601()
+                            ))
+                            .ok();
+                    }
+                }
+                Err(e) => {
+                    staging
+                        .append_log(&format!("{}: cache.open failed: {e}", now_iso8601()))
+                        .ok();
+                }
+            }
         }
     }
 

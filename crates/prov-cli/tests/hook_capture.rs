@@ -9,6 +9,7 @@ use std::path::Path;
 use std::process::Command;
 
 use assert_cmd::Command as AssertCommand;
+use predicates::prelude::*;
 use tempfile::TempDir;
 
 const SID: &str = "sess_fixture001";
@@ -278,6 +279,86 @@ fn end_to_end_capture_writes_note_to_head_on_post_commit() {
         body.contains("\"file\": \"src/lib.rs\""),
         "note missing file: {body}"
     );
+}
+
+#[test]
+fn end_to_end_post_commit_refreshes_sqlite_cache() {
+    // R3 promises sub-50ms warm-cache reads. If post-commit wrote the note
+    // to git but never updated `<git-dir>/prov.db`, `prov log <file>` and
+    // `prov search` after a commit would return "no provenance" until the
+    // user manually ran `prov reindex`.
+    //
+    // We deliberately skip `prov install` here — installing would put a
+    // git post-commit hook on disk that fires during `git commit` itself
+    // (running whichever `prov` binary happens to be on the test process's
+    // PATH, not `target/debug/prov`). That double-fire would do all the
+    // work before our explicit `fire_hook("post-commit")` runs, masking
+    // whether the upsert wiring is actually in play. Initializing the
+    // cache via `prov reindex` gives us the file we need without putting
+    // a self-firing hook on disk.
+    let tmp = init_repo();
+    let root = tmp.path();
+
+    // Parent commit so post-commit's HEAD~1 diff has content to compare.
+    std::fs::write(root.join("README.md"), "# bootstrap\n").unwrap();
+    run_git(root, &["add", "README.md"]);
+    run_git(root, &["commit", "-q", "-m", "chore: bootstrap"]);
+
+    // Initialize the cache file (`<git-dir>/prov.db`). The post-commit
+    // handler's defensive contract is to no-op silently if the cache file
+    // is missing, so without this the upsert path would never run.
+    prov()
+        .current_dir(root)
+        .arg("reindex")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .assert()
+        .success();
+
+    fire_hook(root, "session-start", &read_fixture("session-start.json"));
+    fire_hook(
+        root,
+        "user-prompt-submit",
+        &read_fixture("user-prompt-submit.json"),
+    );
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn hello() -> &'static str {\n    \"hello, prov\"\n}\n",
+    )
+    .unwrap();
+    fire_hook(
+        root,
+        "post-tool-use",
+        &read_fixture("post-tool-use-write.json"),
+    );
+    fire_hook(root, "stop", &read_fixture("stop.json"));
+    run_git(root, &["add", "src/lib.rs"]);
+    run_git(root, &["commit", "-q", "-m", "feat: hello"]);
+    fire_hook(root, "post-commit", "");
+
+    // First-call cache-keyed reads should now hit. Without the upsert
+    // wiring these returned "no provenance" until the user ran
+    // `prov reindex` by hand.
+    prov()
+        .current_dir(root)
+        .args(["log", "src/lib.rs"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello function"));
+
+    // FTS path is independent of the per-file lookup; assert it too so a
+    // future regression can't quietly affect one without the other.
+    prov()
+        .current_dir(root)
+        .args(["search", "hello"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello function"));
 }
 
 #[test]

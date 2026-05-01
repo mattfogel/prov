@@ -221,6 +221,98 @@ impl Cache {
         })
     }
 
+    /// Insert or replace the cached rows for a single note. Used by the
+    /// post-commit handler so the cache stays in sync with `refs/notes/prompts`
+    /// without paying for a full `reindex_from` after every commit.
+    ///
+    /// `ref_sha` should be the SHA of `refs/notes/prompts` *after* the
+    /// corresponding `NotesStore::write` succeeded. Stamping it here lets
+    /// subsequent reads pass the drift check without falling back to the
+    /// notes-ref re-read path.
+    ///
+    /// Like `reindex_from`, all writes commit inside a single transaction so
+    /// a failure mid-flight rolls the cache back to its prior state.
+    pub fn upsert_note(
+        &mut self,
+        commit_sha: &str,
+        note: &Note,
+        ref_sha: Option<&str>,
+    ) -> Result<(), CacheError> {
+        let now = unix_now();
+        let json = note.to_json()?;
+        let tx = self.conn.transaction()?;
+
+        // FTS5 in `content='edits'` external-content mode rejects plain
+        // `DELETE FROM edits_fts WHERE ...`; the application has to issue the
+        // contentless-mode `delete` command per row, supplying the OLD indexed
+        // column values. Read the existing rowid + prompt for this commit's
+        // edits, retract them from the FTS index, then drop the underlying
+        // `notes` row (FK cascade clears `edits` and `content_hashes`).
+        {
+            let mut stmt = tx.prepare("SELECT rowid, prompt FROM edits WHERE commit_sha = ?1")?;
+            let mut rows = stmt.query(params![commit_sha])?;
+            while let Some(row) = rows.next()? {
+                let rowid: i64 = row.get(0)?;
+                let prompt: String = row.get(1)?;
+                tx.execute(
+                    "INSERT INTO edits_fts(edits_fts, rowid, prompt) VALUES('delete', ?1, ?2)",
+                    params![rowid, prompt],
+                )?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM notes WHERE commit_sha = ?1",
+            params![commit_sha],
+        )?;
+
+        tx.execute(
+            "INSERT INTO notes(commit_sha, json, fetched_at) VALUES (?1, ?2, ?3)",
+            params![commit_sha, json, now],
+        )?;
+
+        for (idx, edit) in note.edits.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let edit_idx_i64 = idx as i64;
+            tx.execute(
+                "INSERT INTO edits(commit_sha, edit_idx, file, line_start, line_end,
+                                   prompt, conversation_id, model, ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    commit_sha,
+                    edit_idx_i64,
+                    edit.file,
+                    i64::from(edit.line_range[0]),
+                    i64::from(edit.line_range[1]),
+                    edit.prompt,
+                    edit.conversation_id,
+                    edit.model,
+                    edit.timestamp,
+                ],
+            )?;
+
+            tx.execute(
+                "INSERT INTO edits_fts(rowid, prompt, commit_sha, edit_idx)
+                 SELECT rowid, prompt, ?1, ?2 FROM edits
+                 WHERE commit_sha = ?1 AND edit_idx = ?2",
+                params![commit_sha, edit_idx_i64],
+            )?;
+
+            for (line_idx, hash) in edit.content_hashes.iter().enumerate() {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let line_idx_i64 = line_idx as i64;
+                tx.execute(
+                    "INSERT INTO content_hashes(commit_sha, edit_idx, line_idx, hash)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![commit_sha, edit_idx_i64, line_idx_i64, hash],
+                )?;
+            }
+        }
+
+        write_recorded_notes_ref_sha_tx(&tx, ref_sha)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Look up the cached note for `commit_sha`. Returns `Ok(None)` if absent.
     pub fn get_note(&self, commit_sha: &str) -> Result<Option<Note>, CacheError> {
         let json: Option<String> = self
