@@ -13,19 +13,6 @@ with a commit/PR link).
 
 ## U3 — Capture pipeline (PR #3)
 
-- [ ] **Refresh the SQLite cache on post-commit note write.** When the
-  post-commit handler writes a new note via `NotesStore::write`, it does
-  not update `<git-dir>/prov.db`. Cache-keyed reads (`prov log <file>`
-  whole-file form, `prov search`) miss until the user manually runs
-  `prov reindex`. Symptom: the resolver prints `cache may be stale
-  (recorded=None, live=Some(...))`. Fix: after a successful note write in
-  `crates/prov-cli/src/commands/hook.rs::handle_post_commit`, upsert the
-  new `Note` into the cache directly (single-note insert) and stamp
-  `cache_meta.notes_ref_sha` to the post-write `refs/notes/prompts` SHA.
-  A full reindex on every commit is too heavy at scale — prefer the
-  targeted insert path. Surfaced while dogfooding U5; defeats the
-  warm-cache promise of R3 if left as-is. Owner: U3 closeout.
-
 - [ ] **Populate `original_blob_sha` on matched edits.** The post-commit
   flush currently writes `original_blob_sha: ""` because U3 does not yet
   store the AI's full original output as a git blob. Without it, U14
