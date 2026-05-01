@@ -14,23 +14,26 @@ use prov_core::git::{Git, GitError};
 use prov_core::resolver::Resolver;
 use prov_core::storage::notes::NotesStore;
 use prov_core::storage::sqlite::Cache;
-use prov_core::storage::NOTES_REF_PUBLIC;
+use prov_core::storage::{NOTES_REF_PRIVATE, NOTES_REF_PUBLIC};
 
 /// Filename of the SQLite cache under `<git-dir>/`.
 pub const CACHE_FILENAME: &str = "prov.db";
 
-/// Bundle of read-side handles built from cwd.
+/// Bundle of read-side handles built from cwd. Carries a public and a private
+/// `NotesStore`; reads layer the private ref over the public one so the user
+/// sees their own `# prov:private` notes locally without ever pushing them.
 pub struct RepoHandles {
     pub git: Git,
     pub notes: NotesStore,
+    pub private_notes: NotesStore,
     pub cache: Cache,
     pub cache_path: PathBuf,
 }
 
 impl RepoHandles {
-    /// Discover the repo from cwd, open the public notes ref, and open
-    /// (creating if needed) the cache file. Errors are mapped to user-facing
-    /// messages with exit code 1 (anyhow surfaces a non-zero exit).
+    /// Discover the repo from cwd, open both the public and private notes
+    /// refs, and open (creating if needed) the cache file. Errors map to
+    /// user-facing messages with exit code 1.
     pub fn open() -> anyhow::Result<Self> {
         let cwd = std::env::current_dir().context("could not read current directory")?;
         let git = match Git::discover(&cwd) {
@@ -41,12 +44,14 @@ impl RepoHandles {
             Err(e) => return Err(e.into()),
         };
         let notes = NotesStore::new(git.clone(), NOTES_REF_PUBLIC);
+        let private_notes = NotesStore::new(git.clone(), NOTES_REF_PRIVATE);
         let cache_path = git.git_dir().join(CACHE_FILENAME);
         let cache = Cache::open(&cache_path)
             .with_context(|| format!("failed to open prov cache at {}", cache_path.display()))?;
         Ok(Self {
             git,
             notes,
+            private_notes,
             cache,
             cache_path,
         })

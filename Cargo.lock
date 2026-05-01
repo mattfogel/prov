@@ -497,6 +497,7 @@ dependencies = [
  "clap",
  "predicates",
  "prov-core",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

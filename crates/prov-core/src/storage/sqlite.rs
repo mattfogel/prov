@@ -313,6 +313,125 @@ impl Cache {
         Ok(())
     }
 
+    /// Overlay every note in `store` onto the cache without touching the
+    /// recorded notes-ref SHA. Used to layer the private notes ref on top of
+    /// the public one — the cache tracks freshness against the *public* ref,
+    /// and private notes are local-only so drift detection there is moot.
+    ///
+    /// Like `reindex_from`, an empty/missing ref is not an error: returns
+    /// zero counts.
+    pub fn overlay_from(&mut self, store: &NotesStore) -> Result<ReindexStats, CacheError> {
+        let entries = store.list().map_err(CacheError::from)?;
+        let mut note_count = 0_u32;
+        let mut edit_count = 0_u32;
+        for (sha, note) in &entries {
+            #[allow(clippy::cast_possible_truncation)]
+            let edits_in_note = note.edits.len() as u32;
+            self.upsert_note_no_stamp(sha, note)?;
+            note_count = note_count.saturating_add(1);
+            edit_count = edit_count.saturating_add(edits_in_note);
+        }
+        Ok(ReindexStats {
+            notes: note_count,
+            edits: edit_count,
+        })
+    }
+
+    /// Variant of [`Cache::upsert_note`] that does not touch the recorded
+    /// notes-ref SHA. Used for private-ref upserts so the public ref's
+    /// freshness stamp is preserved.
+    pub fn upsert_note_no_stamp(
+        &mut self,
+        commit_sha: &str,
+        note: &Note,
+    ) -> Result<(), CacheError> {
+        let now = unix_now();
+        let json = note.to_json()?;
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("SELECT rowid, prompt FROM edits WHERE commit_sha = ?1")?;
+            let mut rows = stmt.query(params![commit_sha])?;
+            while let Some(row) = rows.next()? {
+                let rowid: i64 = row.get(0)?;
+                let prompt: String = row.get(1)?;
+                tx.execute(
+                    "INSERT INTO edits_fts(edits_fts, rowid, prompt) VALUES('delete', ?1, ?2)",
+                    params![rowid, prompt],
+                )?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM notes WHERE commit_sha = ?1",
+            params![commit_sha],
+        )?;
+        tx.execute(
+            "INSERT INTO notes(commit_sha, json, fetched_at) VALUES (?1, ?2, ?3)",
+            params![commit_sha, json, now],
+        )?;
+        for (idx, edit) in note.edits.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let edit_idx_i64 = idx as i64;
+            tx.execute(
+                "INSERT INTO edits(commit_sha, edit_idx, file, line_start, line_end,
+                                   prompt, conversation_id, model, ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    commit_sha,
+                    edit_idx_i64,
+                    edit.file,
+                    i64::from(edit.line_range[0]),
+                    i64::from(edit.line_range[1]),
+                    edit.prompt,
+                    edit.conversation_id,
+                    edit.model,
+                    edit.timestamp,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO edits_fts(rowid, prompt, commit_sha, edit_idx)
+                 SELECT rowid, prompt, ?1, ?2 FROM edits
+                 WHERE commit_sha = ?1 AND edit_idx = ?2",
+                params![commit_sha, edit_idx_i64],
+            )?;
+            for (line_idx, hash) in edit.content_hashes.iter().enumerate() {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let line_idx_i64 = line_idx as i64;
+                tx.execute(
+                    "INSERT INTO content_hashes(commit_sha, edit_idx, line_idx, hash)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![commit_sha, edit_idx_i64, line_idx_i64, hash],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop the cached rows for `commit_sha` if any. Used by `prov mark-private`
+    /// after moving a note to the private ref so the cache promptly reflects
+    /// the new ref state without waiting for a reindex.
+    pub fn delete_note(&mut self, commit_sha: &str) -> Result<(), CacheError> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("SELECT rowid, prompt FROM edits WHERE commit_sha = ?1")?;
+            let mut rows = stmt.query(params![commit_sha])?;
+            while let Some(row) = rows.next()? {
+                let rowid: i64 = row.get(0)?;
+                let prompt: String = row.get(1)?;
+                tx.execute(
+                    "INSERT INTO edits_fts(edits_fts, rowid, prompt) VALUES('delete', ?1, ?2)",
+                    params![rowid, prompt],
+                )?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM notes WHERE commit_sha = ?1",
+            params![commit_sha],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Look up the cached note for `commit_sha`. Returns `Ok(None)` if absent.
     pub fn get_note(&self, commit_sha: &str) -> Result<Option<Note>, CacheError> {
         let json: Option<String> = self
