@@ -13,6 +13,25 @@ with a commit/PR link).
 
 ## U3 — Capture pipeline (PR #3)
 
+- [ ] **Surface "captured but not yet flushed" state to the user.** Capture
+  fires on PostToolUse and lives in `<git-dir>/prov-staging/<session_id>/`
+  until `git commit` runs the post-commit handler, which is when the note
+  is actually written and `prov log` / `prov search` see it. The natural
+  user mental model is "prov captures on PostToolUse" and the gap between
+  that and "prov shows on commit" is invisible — staged sessions can sit
+  for hours with no signal that they exist. Surfaced while dogfooding U5:
+  user ran two Claude Code sessions, didn't commit, and was surprised
+  `prov log` didn't reflect them. Options to weigh when picking this up
+  (don't pre-commit a solution): (a) a `prov status` command that lists
+  staged sessions and their staleness; (b) auto-include the staging count
+  in `prov log` / `prov search` output when non-empty ("note: 2 staged
+  sessions not yet committed"); (c) a `prov flush` command that
+  synthesizes a preview note against `git diff --cached` without
+  committing; (d) docs-only fix: README + Skill description make the
+  capture/flush split explicit. Owner: open — likely sits with whoever
+  picks up Phase 2 polish or Phase 3 Skill work, since the Skill (U12)
+  also has to know about commit-vs-staging to behave correctly.
+
 - [ ] **Populate `original_blob_sha` on matched edits.** The post-commit
   flush currently writes `original_blob_sha: ""` because U3 does not yet
   store the AI's full original output as a git blob. Without it, U14
