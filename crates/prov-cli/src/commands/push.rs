@@ -35,6 +35,10 @@ pub struct Args {
 pub fn run(args: Args) -> anyhow::Result<()> {
     let remote = args.remote.unwrap_or_else(|| "origin".to_string());
 
+    // Same fail-fast posture as `prov fetch`: a missing credential helper
+    // should error, not block waiting on a TTY the caller can't drive.
+    super::fetch::disable_git_terminal_prompt();
+
     let cwd = std::env::current_dir().context("could not read current directory")?;
     let git = Git::discover(&cwd).map_err(|e| match e {
         GitError::NotARepo => anyhow!("not in a git repo"),

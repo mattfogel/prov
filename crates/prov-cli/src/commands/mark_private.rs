@@ -45,8 +45,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Resolve the commit-ish to a full SHA so users can pass `HEAD`, short
     // SHAs, or branch names without us guessing whether `git notes show` will
     // resolve them. A bad ref errors here with git's own message.
+    // `--end-of-options` keeps a user-supplied value beginning with `-` from
+    // being parsed as a git flag (e.g., `prov mark-private --version`).
     let resolved = git
-        .capture(["rev-parse", "--verify", &args.commit])
+        .capture(["rev-parse", "--verify", "--end-of-options", &args.commit])
         .map_err(|e| anyhow!("could not resolve commit `{}`: {e}", args.commit))?
         .trim()
         .to_string();
