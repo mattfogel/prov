@@ -36,6 +36,11 @@ use super::common::CACHE_FILENAME;
 /// Embedded post-commit hook template. Source: `githooks/post-commit`.
 const POST_COMMIT_TEMPLATE: &str = include_str!("../../../../githooks/post-commit");
 
+/// Embedded pre-push hook template. Source: `githooks/pre-push`. Owns the U8
+/// secret-scanning gate that fires before notes (or, with
+/// `prov.scanAllPushes`, any push) reach the wire.
+const PRE_PUSH_TEMPLATE: &str = include_str!("../../../../githooks/pre-push");
+
 /// Embedded plugin/hooks/hooks.json so `--plugin`-less installs can mirror the
 /// plugin's hook entries into project-scope `.claude/settings.json`.
 const PLUGIN_HOOKS_JSON: &str = include_str!("../../../../plugin/hooks/hooks.json");
@@ -75,6 +80,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     install_hook(&hook_path, POST_COMMIT_TEMPLATE)
         .with_context(|| format!("installing {}", hook_path.display()))?;
 
+    let pre_push_path = git.git_dir().join("hooks").join("pre-push");
+    install_hook(&pre_push_path, PRE_PUSH_TEMPLATE)
+        .with_context(|| format!("installing {}", pre_push_path.display()))?;
+
     install_claude_settings(&git).context("merging prov entries into .claude/settings.json")?;
 
     if let Some(remote) = args.enable_push.as_deref() {
@@ -87,10 +96,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     println!("prov: installed in {}", git.work_tree().display());
     println!("  hooks:    {}", hook_path.display());
+    println!("  hooks:    {}", pre_push_path.display());
     println!("  cache:    {}", cache_path.display());
     println!("  settings: {}", claude_settings_path(&git).display());
     if let Some(remote) = args.enable_push {
-        println!("  push:     fetch refspec configured for `{remote}` (pre-push gate ships in U8)");
+        println!(
+            "  push:     fetch refspec configured for `{remote}` — pre-push secret gate active"
+        );
     } else {
         println!("  push:     local-only (use `prov install --enable-push <remote>` to opt in)");
     }

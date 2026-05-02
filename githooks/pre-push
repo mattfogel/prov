@@ -1,0 +1,24 @@
+#!/bin/sh
+# prov pre-push hook
+#
+# Calls `prov hook pre-push`, which reads the standard pre-push stdin protocol
+# (`<local-ref> <local-sha> <remote-ref> <remote-sha>` per line) and scans
+# any newly-pushed notes for unredacted secrets. Exits non-zero to abort the
+# push when the gate fires; otherwise exits 0 silently.
+#
+# Unlike the post-commit hook (which is required to never block a commit),
+# this hook intentionally aborts on detected secrets — it is the second line
+# of defense behind the write-time redactor and the user's `--no-verify` is
+# the documented escape hatch.
+#
+# Defensive: if the prov binary isn't on PATH (e.g., the user uninstalled but
+# left the hook), exit 0 so we don't break their push.
+
+if ! command -v prov >/dev/null 2>&1; then
+    exit 0
+fi
+
+# Git passes <remote-name> and <remote-location> as positional args; the
+# handler doesn't use them (everything comes from stdin per githooks(5)), so
+# drop them rather than complicating the CLI surface.
+prov hook pre-push

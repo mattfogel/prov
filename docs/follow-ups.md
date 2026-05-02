@@ -52,6 +52,39 @@ with a commit/PR link).
 
 ---
 
+## U8 — Sync (fetch/push helpers + pre-push gate)
+
+- [ ] **`prov.scanAllPushes` config to extend the gate to non-notes refs.** The
+  v1 gate scopes to `refs/notes/prompts*` per R6's "negligible overhead on
+  regular pushes" requirement. The plan calls out `prov.scanAllPushes` as the
+  opt-in escape hatch for users who want the redactor to also scan diffs of
+  every code commit being pushed. Implementing it requires walking
+  `<remote-sha>..<local-sha>` and running the redactor over each commit's
+  diff text — straightforward but adds latency proportional to the diff size,
+  and needs care around binary blobs and very large pushes. Owner: open;
+  natural pickup once a real user asks for it.
+
+- [ ] **Audit log when `--no-verify` is used directly via `git push`.** When
+  the user runs `prov push --no-verify`, the audit log records the bypass
+  before invoking git (see `commands/push.rs`). When the user instead runs
+  plain `git push --no-verify` (skipping `prov push` entirely), git suppresses
+  every hook — there is no in-band place to record the bypass. Options: (a)
+  a periodic background reconciliation that diffs the local notes ref against
+  the remote tracking ref and warns if a delta exists that the gate would
+  have caught; (b) docs-only — make it clear that `--no-verify` via `git
+  push` directly is unaudited and should be avoided. Owner: open; revisit if
+  team-mode adopters report drift.
+
+- [ ] **Single-commit pinpointing in pre-push error messages.** The gate
+  reports the *annotated commit* SHA carried by each note blob, which is
+  what a user wants to investigate. But for a note attached via squash/merge
+  the user may need extra context to reach the offending source line; pairing
+  the SHA with the file path(s) named in the note's `edits[]` would help.
+  Cheap to add — gate already parses the note. Owner: open; pickup with
+  any future redactor-message polish pass.
+
+---
+
 ## How to add an entry
 
 ```

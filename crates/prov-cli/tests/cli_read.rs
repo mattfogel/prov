@@ -94,6 +94,12 @@ fn install_in_fresh_repo_writes_hooks_settings_and_cache() {
     assert!(hook.contains("prov hook post-commit"));
     assert!(hook.contains("# <<< prov"));
 
+    // Pre-push hook (U8 secret-scanning gate) installed too.
+    let pre_push = std::fs::read_to_string(tmp.path().join(".git/hooks/pre-push")).unwrap();
+    assert!(pre_push.contains("# >>> prov"));
+    assert!(pre_push.contains("prov hook pre-push"));
+    assert!(pre_push.contains("# <<< prov"));
+
     // .claude/settings.json contains all four hook events, each emitted in
     // Claude Code's required entry shape: `{ matcher?, hooks: [{type, command,
     // timeout?}] }`. The earlier shape (top-level `command` on the entry)
@@ -310,6 +316,9 @@ fn uninstall_round_trips_install() {
     let hook = std::fs::read_to_string(&hook_path).unwrap();
     assert!(!hook.contains("# >>> prov"));
     assert!(hook.contains("echo user-original"));
+
+    // Pre-push hook had no user content, so it gets removed entirely.
+    assert!(!tmp.path().join(".git/hooks/pre-push").exists());
 
     // Settings file removed when no other content is present.
     assert!(!tmp.path().join(".claude/settings.json").exists());
