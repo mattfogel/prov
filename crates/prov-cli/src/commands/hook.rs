@@ -69,7 +69,10 @@ pub enum Event {
 
 /// Defensive entry point. Every error path here logs and exits 0 — the run
 /// signature returns `anyhow::Result` only to match the rest of the CLI's
-/// dispatch shape; this handler must never propagate errors out.
+/// dispatch shape. The one exception is `pre-push`: when its secret-scanning
+/// gate fires, the handler intentionally returns an error so the surrounding
+/// `git push` aborts. Internal errors inside pre-push (malformed stdin, etc.)
+/// still log and exit 0 — a Prov bug should never break a user's push.
 #[allow(
     clippy::needless_pass_by_value,
     clippy::unnecessary_wraps,
@@ -81,18 +84,22 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         return Ok(());
     };
     let staging = Staging::new(git.git_dir());
-    let event_label = format!("{:?}", args.event);
 
+    if matches!(args.event, Event::PrePush) {
+        return run_pre_push(&git, &staging);
+    }
+
+    let event_label = format!("{:?}", args.event);
     let result = match args.event {
         Event::UserPromptSubmit => handle_user_prompt_submit(&staging),
         Event::PostToolUse => handle_post_tool_use(&staging, Some(git.work_tree())),
         Event::Stop => handle_stop(&staging),
         Event::SessionStart => handle_session_start(&staging),
         Event::PostCommit => handle_post_commit(&git, &staging),
-        // U9 owns post-rewrite, U8 owns pre-push. Land here as no-ops so the
-        // git hook scripts can wire the command without breaking; later units
-        // fill in real behaviour.
-        Event::PostRewrite { .. } | Event::PrePush => Ok(()),
+        // U9 owns post-rewrite. Land here as a no-op so the git hook script
+        // can wire the command without breaking; U9 fills in real behaviour.
+        Event::PostRewrite { .. } => Ok(()),
+        Event::PrePush => unreachable!("pre-push routed above"),
     };
 
     if let Err(e) = result {
@@ -102,6 +109,30 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Pre-push wrapper. Translates the handler's `PrePushOutcome` into either
+/// `Ok(())` (allow) or an `anyhow::Error` (block, which propagates to main as
+/// a non-zero exit and aborts the surrounding `git push`).
+fn run_pre_push(git: &Git, staging: &Staging) -> anyhow::Result<()> {
+    match handle_pre_push(git) {
+        Ok(PrePushOutcome::Allow) => Ok(()),
+        Ok(PrePushOutcome::Block(reasons)) => {
+            for reason in &reasons {
+                eprintln!("{reason}");
+            }
+            eprintln!();
+            eprintln!(
+                "Re-run after fixing the secrets, or pass `--no-verify` to bypass \
+                 the gate (audit-logged when used via `prov push --no-verify`)."
+            );
+            anyhow::bail!("prov pre-push: blocked by secret-scanning gate");
+        }
+        Err(e) => {
+            let _ = staging.append_log(&format!("{}: hook pre-push failed: {e}", now_iso8601()));
+            Ok(())
+        }
+    }
 }
 
 // =================================================================
@@ -939,6 +970,174 @@ fn read_cherry_pick_head(git: &Git) -> Option<String> {
     let path = git.git_dir().join("CHERRY_PICK_HEAD");
     let s = std::fs::read_to_string(path).ok()?;
     Some(s.trim().to_string())
+}
+
+// =================================================================
+// pre-push (git hook)
+// =================================================================
+
+/// All-zero SHA used by `git push` stdin to mean "no ref" (deletion when in the
+/// local-sha slot, or new ref when in the remote-sha slot).
+const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+
+/// Outcome of `handle_pre_push`. Allow lets the push proceed; Block carries the
+/// user-facing reason lines that get printed to stderr before `git push` aborts.
+#[derive(Debug)]
+enum PrePushOutcome {
+    Allow,
+    Block(Vec<String>),
+}
+
+/// Pre-push gate.
+///
+/// Reads stdin per `githooks(5)`: each line is `<local-ref> <local-sha>
+/// <remote-ref> <remote-sha>`. For each line:
+///
+/// 1. Block if either side names `refs/notes/prompts-private`. Private notes
+///    are local-only; prevent the manual-mapping bypass
+///    (`git push origin refs/notes/prompts-private:refs/notes/prompts`) by
+///    matching on both ref slots.
+/// 2. Skip lines whose local ref is not `refs/notes/prompts` — the gate is
+///    scoped to notes pushes by default per R6 (the alternative,
+///    `prov.scanAllPushes`, is reserved for v1.x).
+/// 3. For each note blob that is new or modified vs the remote tip, run the
+///    redactor over its prompt and summary fields. Any detector hit blocks
+///    the push.
+fn handle_pre_push(git: &Git) -> Result<PrePushOutcome, HandlerError> {
+    let mut buf = String::new();
+    io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|e| HandlerError::Stdin(e.to_string()))?;
+
+    let mut blocks: Vec<String> = Vec::new();
+    let redactor = Redactor::new();
+
+    for raw in buf.lines() {
+        let mut parts = raw.split_whitespace();
+        let (Some(local_ref), Some(local_sha), Some(remote_ref), Some(remote_sha)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            // Malformed line — skip rather than fail. Defensive: a Prov bug
+            // here must not break the user's push.
+            continue;
+        };
+
+        // (1) Private-ref guard. Match on both slots so a manual mapping like
+        // `git push origin refs/notes/prompts-private:refs/notes/prompts` is
+        // also blocked — otherwise the user would route private content onto
+        // the public remote ref and the rest of the gate would never see it.
+        if local_ref == NOTES_REF_PRIVATE || remote_ref == NOTES_REF_PRIVATE {
+            blocks.push(format!(
+                "prov pre-push: refusing to push {NOTES_REF_PRIVATE} \
+                 (mapping {local_ref} → {remote_ref}); private notes are local-only"
+            ));
+            continue;
+        }
+
+        // (2) Default scoping: only scan the public notes ref.
+        if local_ref != NOTES_REF_PUBLIC {
+            continue;
+        }
+
+        // (3) Skip deletions of the public ref — there is no new content to scan.
+        if local_sha == ZERO_SHA {
+            continue;
+        }
+
+        let new_blobs = diff_note_blobs(git, local_sha, remote_sha)?;
+
+        for (commit_sha, blob_sha) in new_blobs {
+            let Ok(content) = git.capture_bytes(["cat-file", "blob", &blob_sha]) else {
+                continue;
+            };
+            let Ok(text) = String::from_utf8(content) else {
+                continue;
+            };
+            // Parse as a note so we scan only prompt + summary text. Running
+            // the redactor over the whole blob would fire on JSON metadata
+            // (timestamps, model names) and produce false positives.
+            let Ok(note) = prov_core::schema::Note::from_json(&text) else {
+                continue;
+            };
+
+            let mut hit_kinds: Vec<String> = Vec::new();
+            for edit in &note.edits {
+                let r = redactor.redact(&edit.prompt);
+                hit_kinds.extend(r.redactions.iter().map(|x| x.kind.as_marker()));
+                if let Some(s) = &edit.preceding_turns_summary {
+                    let r = redactor.redact(s);
+                    hit_kinds.extend(r.redactions.iter().map(|x| x.kind.as_marker()));
+                }
+            }
+            if !hit_kinds.is_empty() {
+                hit_kinds.sort();
+                hit_kinds.dedup();
+                blocks.push(format!(
+                    "prov pre-push: detected unredacted secret(s) in note for commit {commit_sha}: \
+                     [{}]",
+                    hit_kinds.join(", ")
+                ));
+            }
+        }
+    }
+
+    if blocks.is_empty() {
+        Ok(PrePushOutcome::Allow)
+    } else {
+        Ok(PrePushOutcome::Block(blocks))
+    }
+}
+
+/// List `(commit_sha, blob_sha)` pairs for note blobs that exist in `local_sha`
+/// but are absent or different in `remote_sha`. When `remote_sha` is the
+/// all-zero SHA (new ref), every local note is "new".
+fn diff_note_blobs(
+    git: &Git,
+    local_sha: &str,
+    remote_sha: &str,
+) -> Result<Vec<(String, String)>, HandlerError> {
+    let local = list_note_blobs(git, local_sha)?;
+    let remote = if remote_sha == ZERO_SHA {
+        Vec::new()
+    } else {
+        list_note_blobs(git, remote_sha)?
+    };
+    let remote_map: std::collections::HashMap<String, String> = remote.into_iter().collect();
+
+    let mut out = Vec::new();
+    for (path, blob_sha) in local {
+        match remote_map.get(&path) {
+            Some(rsha) if rsha == &blob_sha => {} // unchanged
+            _ => out.push((path, blob_sha)),
+        }
+    }
+    Ok(out)
+}
+
+/// Walk a notes-ref tip's tree and return `(annotated_commit_sha, blob_sha)`
+/// for every note blob. Strips fanout slashes from the path so the returned
+/// commit-sha matches what `git rev-parse` produces.
+fn list_note_blobs(git: &Git, commit_sha: &str) -> Result<Vec<(String, String)>, HandlerError> {
+    let raw = git
+        .capture(["ls-tree", "-r", commit_sha])
+        .map_err(HandlerError::Git)?;
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let Some((meta, path)) = line.split_once('\t') else {
+            continue;
+        };
+        let mut parts = meta.split_whitespace();
+        let _mode = parts.next();
+        let typ = parts.next();
+        let sha = parts.next();
+        if typ != Some("blob") {
+            continue;
+        }
+        let Some(sha) = sha else { continue };
+        let normalized = path.replace('/', "");
+        out.push((normalized, sha.to_string()));
+    }
+    Ok(out)
 }
 
 // =================================================================
