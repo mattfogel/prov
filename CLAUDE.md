@@ -13,3 +13,10 @@ catch them before pushing.
 
 A clean run is the bar. If the script fails, fix the underlying issue
 rather than skipping it — the same check will block the PR otherwise.
+
+## Documented solutions
+
+`docs/solutions/` — documented solutions to past problems (bugs, best
+practices, conventions, workflow patterns), organized by category with
+YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when
+implementing or debugging in documented areas.

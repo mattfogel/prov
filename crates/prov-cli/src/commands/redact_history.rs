@@ -91,8 +91,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     eprintln!("  - Local notes refs are scrubbed, but already-pushed copies, forks, and");
     eprintln!("    teammate clones still hold the pre-rewrite content. Rotate the");
     eprintln!("    underlying secret independently.");
-    eprintln!("  - Teammates can re-sync with: `prov fetch --reset-from-remote && prov reindex`");
-    eprintln!("    (once you have re-pushed the rewritten ref).");
+    eprintln!("  - Local reflog and unreferenced blob objects still hold the pre-rewrite");
+    eprintln!("    content until pruned. Run:");
+    eprintln!("        git reflog expire --expire=now --all");
+    eprintln!("        git gc --prune=now");
+    eprintln!("  - Teammates can re-sync after you re-push the rewritten ref:");
+    eprintln!("        git fetch <remote> +refs/notes/prompts:refs/notes/prompts");
+    eprintln!("        prov reindex");
     Ok(())
 }
 

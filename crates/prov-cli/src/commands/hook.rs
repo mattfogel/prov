@@ -1004,10 +1004,22 @@ enum PrePushOutcome {
 ///    redactor over its prompt and summary fields. Any detector hit blocks
 ///    the push.
 fn handle_pre_push(git: &Git) -> Result<PrePushOutcome, HandlerError> {
+    // Hard cap on pre-push payload size, matching read_stdin_json's defense
+    // against a runaway producer piping gigabytes into the handler. The git
+    // pre-push contract emits one ref-update line per pushed ref; even a
+    // mass push is at most a few KB.
+    const MAX_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
+
     let mut buf = String::new();
-    io::stdin()
+    let bytes_read = io::stdin()
+        .take(MAX_PAYLOAD_BYTES + 1)
         .read_to_string(&mut buf)
         .map_err(|e| HandlerError::Stdin(e.to_string()))?;
+    if u64::try_from(bytes_read).unwrap_or(u64::MAX) > MAX_PAYLOAD_BYTES {
+        return Err(HandlerError::Stdin(format!(
+            "pre-push payload exceeded {MAX_PAYLOAD_BYTES} bytes"
+        )));
+    }
 
     let mut blocks: Vec<String> = Vec::new();
     let redactor = Redactor::new();
@@ -1116,7 +1128,9 @@ fn diff_note_blobs(
 
 /// Walk a notes-ref tip's tree and return `(annotated_commit_sha, blob_sha)`
 /// for every note blob. Strips fanout slashes from the path so the returned
-/// commit-sha matches what `git rev-parse` produces.
+/// commit-sha matches what `git rev-parse` produces. Tree entries whose path
+/// does not collapse to a 40-char hex SHA are skipped — printing a bogus
+/// label inside the gate's block message confuses both humans and agents.
 fn list_note_blobs(git: &Git, commit_sha: &str) -> Result<Vec<(String, String)>, HandlerError> {
     let raw = git
         .capture(["ls-tree", "-r", commit_sha])
@@ -1135,9 +1149,16 @@ fn list_note_blobs(git: &Git, commit_sha: &str) -> Result<Vec<(String, String)>,
         }
         let Some(sha) = sha else { continue };
         let normalized = path.replace('/', "");
+        if !is_full_hex_sha(&normalized) {
+            continue;
+        }
         out.push((normalized, sha.to_string()));
     }
     Ok(out)
+}
+
+fn is_full_hex_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 // =================================================================

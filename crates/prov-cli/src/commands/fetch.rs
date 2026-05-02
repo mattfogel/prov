@@ -5,7 +5,7 @@
 //! (`refs/notes/prompts:refs/notes/origin/prompts`) so the remote's notes never
 //! overwrite local writes. The merge step (`git notes merge`) honors the
 //! `notes.mergeStrategy=manual` config that `prov install` sets, so divergent
-//! notes surface as a merge in progress for `prov notes resolve` (U10) rather
+//! notes surface as a merge in progress for `prov notes-resolve` (U10) rather
 //! than silently picking a side.
 //!
 //! `refs/notes/prompts-private` is intentionally local-only and never fetched.
@@ -28,6 +28,13 @@ const FETCH_REFSPEC: &str = "refs/notes/prompts:refs/notes/origin/prompts";
 pub fn run(args: Args) -> anyhow::Result<()> {
     let remote = args.remote.unwrap_or_else(|| "origin".to_string());
 
+    // Default git network ops to non-interactive: agents and CI can't answer
+    // a TTY prompt, so a stuck credential helper would hang forever instead
+    // of failing fast. Respect an existing override so a human running
+    // `GIT_TERMINAL_PROMPT=1 prov fetch` for a one-off interactive auth
+    // still gets the prompt.
+    disable_git_terminal_prompt();
+
     let cwd = std::env::current_dir().context("could not read current directory")?;
     let git = Git::discover(&cwd).map_err(|e| match e {
         GitError::NotARepo => anyhow!("not in a git repo"),
@@ -36,7 +43,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let before = note_count(&git, NOTES_REF_PUBLIC);
 
-    git.run(["fetch", &remote, FETCH_REFSPEC])
+    // `--` separates options from positionals so a remote name beginning
+    // with `-` is interpreted as a repository, not a flag.
+    git.run(["fetch", "--", &remote, FETCH_REFSPEC])
         .with_context(|| format!("git fetch {remote} {FETCH_REFSPEC}"))?;
 
     // `git notes merge` is a no-op (and errors with "refusing to merge into
@@ -45,19 +54,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let local_sha = ref_sha(&git, NOTES_REF_PUBLIC);
     let tracking_sha = ref_sha(&git, TRACKING_REF);
     match (local_sha.as_deref(), tracking_sha.as_deref()) {
-        (None, Some(_)) => {
+        (None, Some(tracking)) => {
             // First-time fetch: copy the tracking ref to the local ref directly.
-            git.run([
-                "update-ref",
-                NOTES_REF_PUBLIC,
-                tracking_sha.as_ref().unwrap(),
-            ])
-            .with_context(|| format!("update-ref {NOTES_REF_PUBLIC}"))?;
+            git.run(["update-ref", NOTES_REF_PUBLIC, tracking])
+                .with_context(|| format!("update-ref {NOTES_REF_PUBLIC}"))?;
         }
         (Some(local), Some(tracking)) if local != tracking => {
             git.run(["notes", "--ref=prompts", "merge", TRACKING_REF])
                 .with_context(|| {
-                    "notes merge produced a conflict; run `prov notes resolve` to finish"
+                    "notes merge produced a conflict; run `prov notes-resolve` to finish"
                         .to_string()
                 })?;
         }
@@ -84,4 +89,14 @@ fn ref_sha(git: &Git, ref_name: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Set `GIT_TERMINAL_PROMPT=0` for child git invocations unless the user has
+/// explicitly opted into prompts. Shared between `prov fetch` and `prov push`
+/// so the network commands fail fast instead of hanging on a missing
+/// credential helper.
+pub(crate) fn disable_git_terminal_prompt() {
+    if std::env::var_os("GIT_TERMINAL_PROMPT").is_none() {
+        std::env::set_var("GIT_TERMINAL_PROMPT", "0");
+    }
 }
