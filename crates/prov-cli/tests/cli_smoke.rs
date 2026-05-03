@@ -60,9 +60,10 @@ fn no_subcommand_prints_help_and_errors() {
 #[test]
 fn unimplemented_stub_exits_with_code_2() {
     // U5 wired up the read CLI; later units replaced more stubs with real
-    // implementations (U6–U9, …). `notes-resolve` is U10 and still a stub.
+    // implementations (U6–U10, …). `backfill` is still a stub — when that
+    // lands, swap to whichever stub remains.
     prov()
-        .arg("notes-resolve")
+        .arg("backfill")
         .assert()
         .failure()
         .code(2)
