@@ -1,0 +1,24 @@
+#!/bin/sh
+# prov post-rewrite hook
+#
+# Called by git after `git commit --amend` and `git rebase` (interactive or
+# otherwise). Git passes the rewrite kind (`amend` or `rebase`) as $1 and
+# pipes one `<old-sha> <new-sha>` line per rewritten commit on stdin.
+#
+# Calls `prov hook post-rewrite <kind>`, which reattaches notes from the old
+# SHAs to the new SHAs (1:1 for amend / simple rebase, N:1 merge of edits[]
+# arrays for squash).
+#
+# Defensive: never block the rewrite. The Rust handler already exits 0 on
+# internal failure; we wrap in a redirect-and-true so even a missing binary
+# (e.g., user uninstalled prov but left the hook) does not break rebases.
+
+KIND="${1:-rebase}"
+
+if command -v timeout >/dev/null 2>&1; then
+    timeout 30 prov hook post-rewrite "$KIND" >/dev/null 2>&1 || true
+else
+    prov hook post-rewrite "$KIND" >/dev/null 2>&1 || true
+fi
+
+exit 0

@@ -24,6 +24,7 @@
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 
@@ -57,10 +58,9 @@ pub enum Event {
     SessionStart,
     /// Git: `post-commit` — flush staged edits into a note attached to HEAD.
     PostCommit,
-    /// Git: `post-rewrite` — reattach notes after amend/rebase/squash. Owned by U9.
+    /// Git: `post-rewrite` — reattach notes after amend/rebase/squash.
     PostRewrite {
         /// `amend` or `rebase` — git passes this as the first arg.
-        #[allow(dead_code)]
         kind: String,
     },
     /// Git: `pre-push` — scan notes refs for unredacted secrets before push. Owned by U8.
@@ -96,9 +96,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         Event::Stop => handle_stop(&staging),
         Event::SessionStart => handle_session_start(&staging),
         Event::PostCommit => handle_post_commit(&git, &staging),
-        // U9 owns post-rewrite. Land here as a no-op so the git hook script
-        // can wire the command without breaking; U9 fills in real behaviour.
-        Event::PostRewrite { .. } => Ok(()),
+        Event::PostRewrite { kind } => handle_post_rewrite(&git, &staging, &kind),
         Event::PrePush => unreachable!("pre-push routed above"),
     };
 
@@ -970,6 +968,212 @@ fn read_cherry_pick_head(git: &Git) -> Option<String> {
     let path = git.git_dir().join("CHERRY_PICK_HEAD");
     let s = std::fs::read_to_string(path).ok()?;
     Some(s.trim().to_string())
+}
+
+// =================================================================
+// post-rewrite (git hook)
+// =================================================================
+
+/// Read the post-rewrite stdin protocol: each line is `<old-sha> <new-sha>`.
+/// Lines that do not parse to two SHAs are skipped — defensive: a Prov bug
+/// here must not break the surrounding rebase.
+fn read_post_rewrite_pairs() -> Result<Vec<(String, String)>, HandlerError> {
+    const MAX_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024; // 4 MiB
+
+    let mut buf = String::new();
+    let bytes_read = io::stdin()
+        .take(MAX_PAYLOAD_BYTES + 1)
+        .read_to_string(&mut buf)
+        .map_err(|e| HandlerError::Stdin(e.to_string()))?;
+    if u64::try_from(bytes_read).unwrap_or(u64::MAX) > MAX_PAYLOAD_BYTES {
+        return Err(HandlerError::Stdin(format!(
+            "post-rewrite payload exceeded {MAX_PAYLOAD_BYTES} bytes"
+        )));
+    }
+
+    let mut out = Vec::new();
+    for raw in buf.lines() {
+        let mut parts = raw.split_whitespace();
+        let (Some(old), Some(new)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if !is_full_hex_sha(old) || !is_full_hex_sha(new) {
+            continue;
+        }
+        out.push((old.to_string(), new.to_string()));
+    }
+    Ok(out)
+}
+
+/// Post-rewrite handler. Migrates notes from old SHAs to new SHAs after
+/// `git commit --amend` or `git rebase` (interactive or otherwise).
+///
+/// Strategy by mapping shape:
+/// - **1:1** (amend, simple rebase): copy the old SHA's note verbatim onto
+///   the new SHA, then delete the old.
+/// - **N:1** (squash): merge the N old notes' `edits[]` into a single note,
+///   deduplicating by `(conversation_id, turn_index, tool_use_id)` and
+///   sorting by `timestamp`, then delete each old.
+///
+/// `notes.rewrite.amend` and `notes.rewrite.rebase` are set to `false` by
+/// `prov install` so git never auto-concatenates the JSON blobs (which would
+/// produce invalid `{...}{...}` content). This handler is the sole writer.
+///
+/// Both the public `refs/notes/prompts` and private `refs/notes/prompts-private`
+/// refs are migrated, so a private note attached to a rewritten commit follows
+/// the rewrite without leaking out of the private ref.
+///
+/// `kind` is `"amend"` or `"rebase"` per githooks(5); v1 ignores the
+/// distinction — the squash-vs-1:1 decision falls out of the stdin pairs.
+fn handle_post_rewrite(git: &Git, staging: &Staging, kind: &str) -> Result<(), HandlerError> {
+    let pairs = read_post_rewrite_pairs()?;
+    if pairs.is_empty() {
+        return Ok(());
+    }
+
+    // Group old SHAs by their target new SHA so we can detect N:1 squashes.
+    let mut by_new: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (old, new) in &pairs {
+        by_new.entry(new.clone()).or_default().push(old.clone());
+    }
+
+    for (new_sha, old_shas) in by_new {
+        for ref_name in [NOTES_REF_PUBLIC, NOTES_REF_PRIVATE] {
+            if let Err(e) = migrate_one(git, staging, &new_sha, &old_shas, ref_name) {
+                staging
+                    .append_log(&format!(
+                        "{}: post-rewrite ({kind}) ref={ref_name} new={new_sha} failed: {e}",
+                        now_iso8601()
+                    ))
+                    .ok();
+            }
+        }
+    }
+
+    // Cache reflects whatever the notes ref now contains. Drop the cache
+    // entries for every touched commit and re-stamp the public ref so the
+    // resolver doesn't fire its drift-detection reindex on the next read.
+    // The new-SHA notes lazy-load via the existing reindex-on-drift path.
+    let touched: std::collections::BTreeSet<&str> = pairs
+        .iter()
+        .flat_map(|(o, n)| [o.as_str(), n.as_str()])
+        .collect();
+    super::common::invalidate_cache_per_sha(git, touched);
+
+    Ok(())
+}
+
+/// Migrate notes for a single `(new_sha, [old_shas])` group on one notes ref.
+/// Reads each present old note; for 1:1 writes the lone note verbatim, for
+/// N:1 merges edits arrays. Removes old notes only after the new write
+/// succeeds, so a crash mid-handler leaves the source notes intact.
+fn migrate_one(
+    git: &Git,
+    staging: &Staging,
+    new_sha: &str,
+    old_shas: &[String],
+    ref_name: &str,
+) -> Result<(), anyhow::Error> {
+    let store = NotesStore::new(git.clone(), ref_name);
+
+    // Collect any notes that actually exist on the old SHAs. Old SHAs without
+    // a note simply contribute nothing (the squashed commit may include some
+    // commits that had no AI provenance).
+    let mut sources: Vec<(String, Note)> = Vec::new();
+    for old in old_shas {
+        if let Some(note) = store.read(old).context("read old note")? {
+            sources.push((old.clone(), note));
+        }
+    }
+    if sources.is_empty() {
+        return Ok(());
+    }
+
+    // Don't clobber an existing note on the new SHA — the post-commit handler
+    // may already have written one (e.g., rebase that re-applies a commit and
+    // re-runs hooks). Merge those edits in too so we don't drop history.
+    let existing_on_new = store.read(new_sha).context("read new note")?;
+
+    let merged = if sources.len() == 1 && existing_on_new.is_none() {
+        // 1:1 fast path — no merge needed.
+        sources.into_iter().next().map(|(_, n)| n).unwrap()
+    } else {
+        let mut all_edits: Vec<Edit> = Vec::new();
+        if let Some(n) = existing_on_new {
+            all_edits.extend(n.edits);
+        }
+        for (_, n) in sources {
+            all_edits.extend(n.edits);
+        }
+        Note::new(dedupe_and_sort_edits(all_edits))
+    };
+
+    store.write(new_sha, &merged).context("write new note")?;
+
+    // Remove old notes after the write succeeds. If a remove fails, the new
+    // note is already in place — the orphan cleanup is best-effort. Log
+    // failures so silent orphan accumulation surfaces in the staging log
+    // rather than only via `prov gc` later.
+    for old in old_shas {
+        if old == new_sha {
+            // Defensive: a no-op rewrite (some `git rebase` paths emit
+            // identical pairs) would otherwise delete the note we just wrote.
+            continue;
+        }
+        if let Err(e) = store.remove(old) {
+            staging
+                .append_log(&format!(
+                    "{}: post-rewrite remove old note failed (ref={ref_name} old={old}): {e}",
+                    now_iso8601()
+                ))
+                .ok();
+        }
+    }
+    Ok(())
+}
+
+/// Deduplicate edits and sort by `timestamp` ascending. Edits that share the
+/// dedupe key are collapsed keeping the entry with the latest `timestamp` so
+/// a later-captured version wins over an earlier one (matters when the same
+/// edit was re-staged).
+///
+/// Dedupe key:
+/// - When `tool_use_id` is `Some(_)`: `(conversation_id, turn_index, tool_use_id)`.
+/// - When `tool_use_id` is `None`: fall back to
+///   `(conversation_id, turn_index, file, line_range)` so distinct file regions
+///   in the same turn don't collapse. Without this fallback, a MultiEdit whose
+///   inner edits don't surface a tool_use_id (or a `prov backfill` note that
+///   has none) would silently lose all but one edit on squash.
+fn dedupe_and_sort_edits(edits: Vec<Edit>) -> Vec<Edit> {
+    use std::collections::BTreeMap;
+    // `Either` shape inlined as a tuple of (primary-key, fallback-discriminator).
+    // The fallback string is empty when `tool_use_id.is_some()` so the two
+    // shapes can't collide in the same map.
+    type Key = (String, u32, Option<String>, String);
+    let mut by_key: BTreeMap<Key, Edit> = BTreeMap::new();
+    for e in edits {
+        let fallback = if e.tool_use_id.is_none() {
+            format!("{}@{}-{}", e.file, e.line_range[0], e.line_range[1])
+        } else {
+            String::new()
+        };
+        let key: Key = (
+            e.conversation_id.clone(),
+            e.turn_index,
+            e.tool_use_id.clone(),
+            fallback,
+        );
+        match by_key.get(&key) {
+            Some(existing) if existing.timestamp >= e.timestamp => {}
+            _ => {
+                by_key.insert(key, e);
+            }
+        }
+    }
+    let mut out: Vec<Edit> = by_key.into_values().collect();
+    out.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    out
 }
 
 // =================================================================

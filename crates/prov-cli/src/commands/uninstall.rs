@@ -38,7 +38,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         other => other.into(),
     })?;
 
-    for hook_name in ["post-commit", "pre-push"] {
+    for hook_name in ["post-commit", "pre-push", "post-rewrite"] {
         let hook_path = git.git_dir().join("hooks").join(hook_name);
         uninstall_hook(&hook_path)
             .with_context(|| format!("uninstalling {}", hook_path.display()))?;

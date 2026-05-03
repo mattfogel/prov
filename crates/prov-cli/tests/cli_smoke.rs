@@ -59,10 +59,10 @@ fn no_subcommand_prints_help_and_errors() {
 
 #[test]
 fn unimplemented_stub_exits_with_code_2() {
-    // U5 wired up the read CLI (log/search/reindex/pr-timeline/install/uninstall);
-    // the remaining Phase-2/3 commands are still stubs. `repair` is one of them.
+    // U5 wired up the read CLI; later units replaced more stubs with real
+    // implementations (U6–U9, …). `notes-resolve` is U10 and still a stub.
     prov()
-        .arg("repair")
+        .arg("notes-resolve")
         .assert()
         .failure()
         .code(2)
