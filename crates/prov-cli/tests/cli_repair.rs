@@ -295,9 +295,9 @@ fn gc_prunes_stale_staging_sessions() {
     let marker = session_dir.join("turn-0.json");
     std::fs::write(&marker, "{}").unwrap();
 
-    // Backdate via std::fs::File::set_modified (stable since 1.75 — matches
-    // workspace MSRV). Avoids pulling in `filetime` for one test setup.
-    let thirty_days_ago = SystemTime::now() - Duration::from_secs(30 * 86_400);
+    // Backdate via std::fs::File::set_modified. Avoids pulling in `filetime`
+    // for one test setup.
+    let thirty_days_ago = SystemTime::now() - Duration::from_hours(30 * 24);
     let f = std::fs::OpenOptions::new()
         .write(true)
         .open(&marker)
