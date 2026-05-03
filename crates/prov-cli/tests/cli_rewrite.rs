@@ -138,62 +138,73 @@ fn amend_one_to_one_preserves_note() {
 
 #[test]
 fn rebase_reorder_preserves_each_note() {
+    // Drive post-rewrite with three real (old, new) amend pairs across
+    // independent branches. Earlier versions of this test fed fabricated
+    // 40-hex-digit SHAs that passed `is_full_hex_sha` but didn't reference
+    // real git objects — the test then "passed" without ever exercising
+    // `git notes add --force` against a real commit. Using real amends per
+    // branch keeps each pair end-to-end realistic.
     let tmp = init_repo();
     let root = tmp.path();
-    let a = make_commit(root, "a\n", "A");
-    let b = make_commit(root, "ab\n", "B");
-    let c = make_commit(root, "abc\n", "C");
+    let _seed = make_commit(root, "seed\n", "seed");
+    let seed = head_sha(root);
+
+    let pairs: Vec<(String, String, &str)> = ["a", "b", "c"]
+        .iter()
+        .map(|tag| {
+            let branch = format!("feat-{tag}");
+            run_git(root, &["checkout", "-q", "-b", &branch, &seed]);
+            std::fs::write(root.join("README.md"), format!("{tag}\n")).unwrap();
+            run_git(root, &["add", "README.md"]);
+            run_git(root, &["commit", "-q", "-m", &format!("{tag} v1")]);
+            let old = head_sha(root);
+            run_git(
+                root,
+                &[
+                    "commit",
+                    "--amend",
+                    "-q",
+                    "-m",
+                    &format!("{tag} amended"),
+                    "--allow-empty",
+                ],
+            );
+            let new = head_sha(root);
+            assert_ne!(old, new);
+            (old, new, *tag)
+        })
+        .collect();
 
     let git = Git::discover(root).unwrap();
     let store = NotesStore::new(git.clone(), NOTES_REF_PUBLIC);
-    store
-        .write(
-            &a,
-            &Note::new(vec![make_edit("A's prompt", "sess_a", 0, Some("toolu_a"))]),
-        )
-        .unwrap();
-    store
-        .write(
-            &b,
-            &Note::new(vec![make_edit("B's prompt", "sess_b", 0, Some("toolu_b"))]),
-        )
-        .unwrap();
-    store
-        .write(
-            &c,
-            &Note::new(vec![make_edit("C's prompt", "sess_c", 0, Some("toolu_c"))]),
-        )
-        .unwrap();
+    for (old, _new, tag) in &pairs {
+        let prompt = format!("{tag}'s prompt");
+        let conv = format!("sess_{tag}");
+        let toolu = format!("toolu_{tag}");
+        store
+            .write(
+                old,
+                &Note::new(vec![make_edit(&prompt, &conv, 0, Some(&toolu))]),
+            )
+            .unwrap();
+    }
 
-    // Simulate rebase that produced 3 new SHAs (we don't care if they look
-    // like a real rebase — the handler only sees the pairs).
-    let new_a = "1111111111111111111111111111111111111111";
-    let new_b = "2222222222222222222222222222222222222222";
-    let new_c = "3333333333333333333333333333333333333333";
-    let stdin = format!("{a} {new_a}\n{b} {new_b}\n{c} {new_c}\n");
+    let mut stdin = String::new();
+    for (old, new, _) in &pairs {
+        use std::fmt::Write;
+        writeln!(stdin, "{old} {new}").unwrap();
+    }
     prov_in(root)
         .args(["hook", "post-rewrite", "rebase"])
         .write_stdin(stdin)
         .assert()
         .success();
 
-    // Each note migrated.
-    assert_eq!(
-        store.read(new_a).unwrap().unwrap().edits[0].prompt,
-        "A's prompt"
-    );
-    assert_eq!(
-        store.read(new_b).unwrap().unwrap().edits[0].prompt,
-        "B's prompt"
-    );
-    assert_eq!(
-        store.read(new_c).unwrap().unwrap().edits[0].prompt,
-        "C's prompt"
-    );
-    // Old notes removed.
-    assert!(store.read(&a).unwrap().is_none());
-    assert!(store.read(&b).unwrap().is_none());
-    assert!(store.read(&c).unwrap().is_none());
+    for (old, new, tag) in &pairs {
+        let on_new = store.read(new).unwrap().expect("note migrated");
+        assert_eq!(on_new.edits[0].prompt, format!("{tag}'s prompt"));
+        assert!(store.read(old).unwrap().is_none(), "old {tag} removed");
+    }
 }
 
 #[test]
@@ -500,4 +511,91 @@ fn cherry_pick_stamps_derived_from_via_post_commit() {
         }
         other => panic!("expected DerivedFrom::Rewrite, got {other:?}"),
     }
+}
+
+#[test]
+fn squash_with_none_tool_use_id_keeps_distinct_file_regions() {
+    // Regression: when MultiEdit-decomposed edits don't surface a tool_use_id,
+    // the dedupe key was `(conversation_id, turn_index, None)` and three
+    // distinct file regions in the same turn collapsed to one. The fallback
+    // `(file, line_range)` discriminator preserves them.
+    let tmp = init_repo();
+    let root = tmp.path();
+    let a = make_commit(root, "a\n", "A");
+    let b = make_commit(root, "ab\n", "B");
+
+    let git = Git::discover(root).unwrap();
+    let store = NotesStore::new(git.clone(), NOTES_REF_PUBLIC);
+
+    // Three edits sharing (conv_id="sess_m", turn_index=0, tool_use_id=None)
+    // but on different file regions — the realistic shape after a MultiEdit
+    // capture loses tool_use_ids.
+    let mk = |file: &str, line: u32, prompt: &str| {
+        let mut e = make_edit(prompt, "sess_m", 0, None);
+        e.file = file.into();
+        e.line_range = [line, line];
+        e.timestamp = format!("2026-04-28T12:00:{line:02}Z");
+        e
+    };
+    store
+        .write(
+            &a,
+            &Note::new(vec![
+                mk("src/lib.rs", 1, "edit 1"),
+                mk("src/main.rs", 2, "edit 2"),
+            ]),
+        )
+        .unwrap();
+    store
+        .write(&b, &Note::new(vec![mk("src/util.rs", 3, "edit 3")]))
+        .unwrap();
+
+    // Squash A and B into a single new SHA.
+    run_git(
+        root,
+        &["commit", "--amend", "-q", "-m", "squashed", "--allow-empty"],
+    );
+    let new = head_sha(root);
+    let stdin = format!("{a} {new}\n{b} {new}\n");
+    prov_in(root)
+        .args(["hook", "post-rewrite", "rebase"])
+        .write_stdin(stdin)
+        .assert()
+        .success();
+
+    let merged = store.read(&new).unwrap().expect("squash note present");
+    assert_eq!(
+        merged.edits.len(),
+        3,
+        "all three None-tool_use_id edits preserved; got prompts {:?}",
+        merged.edits.iter().map(|e| &e.prompt).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn rewrite_no_op_pair_preserves_note() {
+    // Defensive guard: some `git rebase` paths emit identical (old, new)
+    // pairs (the no-op rewrite). The handler must not write-then-delete and
+    // wipe the note on the (unchanged) target SHA.
+    let tmp = init_repo();
+    let root = tmp.path();
+    let head = make_commit(root, "v1\n", "first");
+
+    let git = Git::discover(root).unwrap();
+    let store = NotesStore::new(git, NOTES_REF_PUBLIC);
+    store
+        .write(
+            &head,
+            &Note::new(vec![make_edit("noop", "sess_n", 0, Some("toolu_n"))]),
+        )
+        .unwrap();
+
+    prov_in(root)
+        .args(["hook", "post-rewrite", "amend"])
+        .write_stdin(format!("{head} {head}\n"))
+        .assert()
+        .success();
+
+    let still_there = store.read(&head).unwrap().expect("note preserved on no-op");
+    assert_eq!(still_there.edits[0].prompt, "noop");
 }

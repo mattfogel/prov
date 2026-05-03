@@ -24,6 +24,7 @@
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 
@@ -1039,7 +1040,7 @@ fn handle_post_rewrite(git: &Git, staging: &Staging, kind: &str) -> Result<(), H
 
     for (new_sha, old_shas) in by_new {
         for ref_name in [NOTES_REF_PUBLIC, NOTES_REF_PRIVATE] {
-            if let Err(e) = migrate_one(git, &new_sha, &old_shas, ref_name) {
+            if let Err(e) = migrate_one(git, staging, &new_sha, &old_shas, ref_name) {
                 staging
                     .append_log(&format!(
                         "{}: post-rewrite ({kind}) ref={ref_name} new={new_sha} failed: {e}",
@@ -1050,27 +1051,15 @@ fn handle_post_rewrite(git: &Git, staging: &Staging, kind: &str) -> Result<(), H
         }
     }
 
-    // Cache reflects whatever the notes ref now contains. Cheapest correct
-    // path: drop the cache entries for every touched commit and let the next
-    // resolver call repopulate from the ref. If the cache file isn't there,
-    // there's nothing to invalidate.
-    let cache_path = git.git_dir().join(CACHE_FILENAME);
-    if cache_path.exists() {
-        if let Ok(mut cache) = Cache::open(&cache_path) {
-            let touched: std::collections::BTreeSet<&str> = pairs
-                .iter()
-                .flat_map(|(o, n)| [o.as_str(), n.as_str()])
-                .collect();
-            for sha in touched {
-                let _ = cache.delete_note(sha);
-            }
-            // Re-stamp the public ref SHA so cache-coherency checks don't fire
-            // on the next resolver call. The new-SHA notes will lazy-load on
-            // next access via the existing reindex-on-drift path.
-            let public = NotesStore::new(git.clone(), NOTES_REF_PUBLIC);
-            let _ = cache.set_recorded_notes_ref_sha(public.ref_sha().ok().flatten().as_deref());
-        }
-    }
+    // Cache reflects whatever the notes ref now contains. Drop the cache
+    // entries for every touched commit and re-stamp the public ref so the
+    // resolver doesn't fire its drift-detection reindex on the next read.
+    // The new-SHA notes lazy-load via the existing reindex-on-drift path.
+    let touched: std::collections::BTreeSet<&str> = pairs
+        .iter()
+        .flat_map(|(o, n)| [o.as_str(), n.as_str()])
+        .collect();
+    super::common::invalidate_cache_per_sha(git, touched);
 
     Ok(())
 }
@@ -1081,10 +1070,11 @@ fn handle_post_rewrite(git: &Git, staging: &Staging, kind: &str) -> Result<(), H
 /// succeeds, so a crash mid-handler leaves the source notes intact.
 fn migrate_one(
     git: &Git,
+    staging: &Staging,
     new_sha: &str,
     old_shas: &[String],
     ref_name: &str,
-) -> Result<(), NotesMigrateError> {
+) -> Result<(), anyhow::Error> {
     let store = NotesStore::new(git.clone(), ref_name);
 
     // Collect any notes that actually exist on the old SHAs. Old SHAs without
@@ -1092,7 +1082,7 @@ fn migrate_one(
     // commits that had no AI provenance).
     let mut sources: Vec<(String, Note)> = Vec::new();
     for old in old_shas {
-        if let Some(note) = store.read(old).map_err(NotesMigrateError::Read)? {
+        if let Some(note) = store.read(old).context("read old note")? {
             sources.push((old.clone(), note));
         }
     }
@@ -1103,7 +1093,7 @@ fn migrate_one(
     // Don't clobber an existing note on the new SHA — the post-commit handler
     // may already have written one (e.g., rebase that re-applies a commit and
     // re-runs hooks). Merge those edits in too so we don't drop history.
-    let existing_on_new = store.read(new_sha).map_err(NotesMigrateError::Read)?;
+    let existing_on_new = store.read(new_sha).context("read new note")?;
 
     let merged = if sources.len() == 1 && existing_on_new.is_none() {
         // 1:1 fast path — no merge needed.
@@ -1119,36 +1109,60 @@ fn migrate_one(
         Note::new(dedupe_and_sort_edits(all_edits))
     };
 
-    store
-        .write(new_sha, &merged)
-        .map_err(NotesMigrateError::Write)?;
+    store.write(new_sha, &merged).context("write new note")?;
 
     // Remove old notes after the write succeeds. If a remove fails, the new
-    // note is already in place — the orphan cleanup is best-effort.
+    // note is already in place — the orphan cleanup is best-effort. Log
+    // failures so silent orphan accumulation surfaces in the staging log
+    // rather than only via `prov gc` later.
     for old in old_shas {
         if old == new_sha {
             // Defensive: a no-op rewrite (some `git rebase` paths emit
             // identical pairs) would otherwise delete the note we just wrote.
             continue;
         }
-        let _ = store.remove(old);
+        if let Err(e) = store.remove(old) {
+            staging
+                .append_log(&format!(
+                    "{}: post-rewrite remove old note failed (ref={ref_name} old={old}): {e}",
+                    now_iso8601()
+                ))
+                .ok();
+        }
     }
     Ok(())
 }
 
-/// Deduplicate edits by `(conversation_id, turn_index, tool_use_id)` and sort
-/// by `timestamp` ascending. Edits that share the dedupe key are collapsed
-/// keeping the entry with the latest `timestamp` so a later-captured version
-/// wins over an earlier one (matters when the same edit was re-staged).
+/// Deduplicate edits and sort by `timestamp` ascending. Edits that share the
+/// dedupe key are collapsed keeping the entry with the latest `timestamp` so
+/// a later-captured version wins over an earlier one (matters when the same
+/// edit was re-staged).
+///
+/// Dedupe key:
+/// - When `tool_use_id` is `Some(_)`: `(conversation_id, turn_index, tool_use_id)`.
+/// - When `tool_use_id` is `None`: fall back to
+///   `(conversation_id, turn_index, file, line_range)` so distinct file regions
+///   in the same turn don't collapse. Without this fallback, a MultiEdit whose
+///   inner edits don't surface a tool_use_id (or a `prov backfill` note that
+///   has none) would silently lose all but one edit on squash.
 fn dedupe_and_sort_edits(edits: Vec<Edit>) -> Vec<Edit> {
     use std::collections::BTreeMap;
-    type Key = (String, u32, Option<String>);
+    // `Either` shape inlined as a tuple of (primary-key, fallback-discriminator).
+    // The fallback string is empty when `tool_use_id.is_some()` so the two
+    // shapes can't collide in the same map.
+    type Key = (String, u32, Option<String>, String);
     let mut by_key: BTreeMap<Key, Edit> = BTreeMap::new();
     for e in edits {
+        let fallback = if e.tool_use_id.is_none() {
+            format!("{}@{}-{}", e.file, e.line_range[0], e.line_range[1])
+        } else {
+            String::new()
+        };
         let key: Key = (
             e.conversation_id.clone(),
             e.turn_index,
             e.tool_use_id.clone(),
+            fallback,
         );
         match by_key.get(&key) {
             Some(existing) if existing.timestamp >= e.timestamp => {}
@@ -1160,14 +1174,6 @@ fn dedupe_and_sort_edits(edits: Vec<Edit>) -> Vec<Edit> {
     let mut out: Vec<Edit> = by_key.into_values().collect();
     out.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
     out
-}
-
-#[derive(Debug, thiserror::Error)]
-enum NotesMigrateError {
-    #[error("read failed: {0}")]
-    Read(prov_core::storage::notes::NotesError),
-    #[error("write failed: {0}")]
-    Write(prov_core::storage::notes::NotesError),
 }
 
 // =================================================================

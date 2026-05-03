@@ -28,6 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
 use clap::Parser;
+use serde::Serialize;
 
 use prov_core::git::{Git, GitError};
 use prov_core::storage::notes::NotesStore;
@@ -51,6 +52,20 @@ pub struct Args {
     /// Print what would change without writing.
     #[arg(long)]
     pub dry_run: bool,
+    /// Emit JSON instead of human-readable output. The Skill (U12) and other
+    /// agents depend on this to parse housekeeping results without scraping.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Serialize)]
+struct GcJson {
+    culled_public: Vec<String>,
+    culled_private: Vec<String>,
+    pruned_sessions: Vec<String>,
+    compacted: Vec<String>,
+    dry_run: bool,
+    prov_version: &'static str,
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -61,64 +76,91 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         other => anyhow::Error::from(other),
     })?;
 
-    let mut culled_public = 0_u32;
-    let mut culled_private = 0_u32;
-    for ref_name in [NOTES_REF_PUBLIC, NOTES_REF_PRIVATE] {
-        let n = cull_unreachable(&git, ref_name, args.dry_run)
-            .with_context(|| format!("culling unreachable notes on {ref_name}"))?;
-        if ref_name == NOTES_REF_PUBLIC {
-            culled_public = n;
-        } else {
-            culled_private = n;
-        }
-    }
+    let culled_public = cull_unreachable(&git, NOTES_REF_PUBLIC, args.dry_run)
+        .with_context(|| format!("culling unreachable notes on {NOTES_REF_PUBLIC}"))?;
+    let culled_private = cull_unreachable(&git, NOTES_REF_PRIVATE, args.dry_run)
+        .with_context(|| format!("culling unreachable notes on {NOTES_REF_PRIVATE}"))?;
 
     let pruned_sessions = prune_staging(&git, args.staging_ttl_days, args.dry_run);
 
-    let mut compacted = 0_u32;
+    let mut compacted: Vec<String> = Vec::new();
     if args.compact {
         for ref_name in [NOTES_REF_PUBLIC, NOTES_REF_PRIVATE] {
-            compacted = compacted.saturating_add(
+            compacted.extend(
                 compact_old_notes(&git, ref_name, args.dry_run)
                     .with_context(|| format!("compacting old notes on {ref_name}"))?,
             );
         }
     }
 
-    if !args.dry_run && (culled_public + culled_private + compacted) > 0 {
+    let total_changed = culled_public.len() + culled_private.len() + compacted.len();
+    if !args.dry_run && total_changed > 0 {
         invalidate_cache(&git);
+    }
+
+    if args.json {
+        let payload = GcJson {
+            culled_public,
+            culled_private,
+            pruned_sessions,
+            compacted,
+            dry_run: args.dry_run,
+            prov_version: env!("CARGO_PKG_VERSION"),
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
     }
 
     let label = if args.dry_run { " (dry-run)" } else { "" };
     println!(
-        "prov gc{label}: culled {culled_public} public + {culled_private} private unreachable note(s); \
-         pruned {pruned_sessions} stale staging session(s); \
-         compacted {compacted} note(s)"
+        "prov gc{label}: culled {} public + {} private unreachable note(s); \
+         pruned {} stale staging session(s); \
+         compacted {} note(s)",
+        culled_public.len(),
+        culled_private.len(),
+        pruned_sessions.len(),
+        compacted.len(),
     );
+    if !args.dry_run && (culled_public.len() + culled_private.len()) > 0 {
+        println!(
+            "  note: reflog entries and unreferenced note blobs are preserved. \
+             To fully reclaim space locally: \
+             `git reflog expire --expire=now --all && git gc --prune=now`. \
+             Already-pushed copies on remotes are NOT scrubbed — re-push the notes ref."
+        );
+    }
     Ok(())
 }
 
-/// Return true if `commit_sha` is reachable from any ref. Uses
-/// `git rev-list --no-walk --all <sha>`-style logic; the practical check is
-/// `git cat-file -e <sha>` (object exists) AND `git merge-base --is-ancestor
-/// <sha> <ref>` for at least one ref. Cheaper: ask git for every ref tip and
-/// see if `git merge-base --is-ancestor` succeeds for any.
+/// Return true if `commit_sha` is reachable from any ref or from HEAD.
 ///
-/// The simplest correct path: `git for-each-ref --contains <sha>` — git
-/// returns the list of refs that reach the commit. Empty output ⇒ unreachable.
+/// Three-step check: existence guard (`cat-file -e`), then `for-each-ref
+/// --contains` for ref-reachable commits, then HEAD reachability via
+/// `merge-base --is-ancestor` to catch detached-HEAD WIP that no branch
+/// points at.
+///
+/// Reflog-only-reachable commits (e.g., a deleted-branch tip still pinned
+/// by HEAD's reflog) are intentionally treated as unreachable per the
+/// strict ref-reachability policy in the plan — git's own gc will expire
+/// the reflog entries on its own schedule, and prov's tracking should
+/// match the visible-refs view. Without HEAD coverage, `prov gc` would
+/// cull notes attached to in-progress detached-HEAD work — `git
+/// for-each-ref` does not consider HEAD as a starting point.
 fn is_reachable(git: &Git, commit_sha: &str) -> bool {
-    // Defensive: missing object is by definition unreachable. Guard with an
-    // explicit existence check so for-each-ref doesn't error noisily.
     if git.run(["cat-file", "-e", commit_sha]).is_err() {
         return false;
     }
-    match git.capture(["for-each-ref", "--contains", commit_sha]) {
-        Ok(s) => !s.trim().is_empty(),
-        Err(_) => false,
+    if let Ok(s) = git.capture(["for-each-ref", "--contains", commit_sha]) {
+        if !s.trim().is_empty() {
+            return true;
+        }
     }
+    git.run(["merge-base", "--is-ancestor", commit_sha, "HEAD"])
+        .is_ok()
 }
 
-fn cull_unreachable(git: &Git, ref_name: &str, dry_run: bool) -> Result<u32, GitError> {
+/// Returns the SHAs of culled (or, in dry-run, would-be-culled) notes.
+fn cull_unreachable(git: &Git, ref_name: &str, dry_run: bool) -> Result<Vec<String>, GitError> {
     let store = NotesStore::new(git.clone(), ref_name);
     let entries = match store.list() {
         Ok(v) => v,
@@ -126,47 +168,52 @@ fn cull_unreachable(git: &Git, ref_name: &str, dry_run: bool) -> Result<u32, Git
         Err(prov_core::storage::notes::NotesError::Schema(_)) => {
             // A note we can't parse isn't reachable for our purposes; leave it
             // alone — the user can re-run after upgrading prov.
-            return Ok(0);
+            return Ok(Vec::new());
         }
     };
 
-    let mut culled = 0_u32;
+    let mut culled: Vec<String> = Vec::new();
     for (sha, _note) in entries {
         if is_reachable(git, &sha) {
             continue;
         }
         if dry_run {
             println!("prov gc (dry-run, {ref_name}): would cull note for unreachable {sha}");
+            culled.push(sha);
             continue;
         }
         if let Err(e) = store.remove(&sha) {
             eprintln!("prov gc: removing note for {sha} on {ref_name} failed: {e}");
             continue;
         }
-        culled = culled.saturating_add(1);
+        culled.push(sha);
     }
     Ok(culled)
 }
 
 /// Walk `<git-dir>/prov-staging/<session>/` and remove session dirs whose most
-/// recent file mtime is older than `ttl_days`. Defensive: a session that's
-/// currently being written to (modified within TTL) is preserved.
-fn prune_staging(git: &Git, ttl_days: u32, dry_run: bool) -> u32 {
+/// recent file mtime is older than `ttl_days`. Returns the session ids of
+/// pruned (or, in dry-run, would-be-pruned) sessions. Defensive: a session
+/// that's currently being written to (modified within TTL) is preserved.
+fn prune_staging(git: &Git, ttl_days: u32, dry_run: bool) -> Vec<String> {
     let staging_root = git.git_dir().join(STAGING_DIRNAME);
     if !staging_root.exists() {
-        return 0;
+        return Vec::new();
     }
     let Some(cutoff) = SystemTime::now().checked_sub(Duration::from_secs(
         u64::from(ttl_days).saturating_mul(86_400),
     )) else {
-        return 0;
+        return Vec::new();
     };
     let staging = Staging::new(git.git_dir());
     let sessions = staging.list_sessions().unwrap_or_default();
-    let mut pruned = 0_u32;
+    let mut pruned: Vec<String> = Vec::new();
     for sid in sessions {
         let dir = staging.session_dir(&sid, false);
-        let last_mtime = newest_mtime(&dir).unwrap_or_else(SystemTime::now);
+        // An empty/unreadable session dir has no mtime to anchor on. Treat
+        // it as maximally stale (UNIX_EPOCH) so it falls past any cutoff and
+        // gets pruned, instead of falling back to `now()` and surviving forever.
+        let last_mtime = newest_mtime(&dir).unwrap_or(UNIX_EPOCH);
         if last_mtime >= cutoff {
             continue;
         }
@@ -175,6 +222,7 @@ fn prune_staging(git: &Git, ttl_days: u32, dry_run: bool) -> u32 {
                 "prov gc (dry-run): would prune staging session {} (idle ≥ {ttl_days}d)",
                 sid.as_str()
             );
+            pruned.push(sid.as_str().to_string());
             continue;
         }
         if let Err(e) = staging.remove_session(&sid) {
@@ -184,22 +232,23 @@ fn prune_staging(git: &Git, ttl_days: u32, dry_run: bool) -> u32 {
             );
             continue;
         }
-        pruned = pruned.saturating_add(1);
+        pruned.push(sid.as_str().to_string());
     }
     pruned
 }
 
 /// Compact notes older than [`COMPACT_AGE_DAYS`] by clearing
 /// `preceding_turns_summary` and unreachable `original_blob_sha` fields.
+/// Returns the SHAs of compacted (or, in dry-run, would-be-compacted) notes.
 /// "Older" is measured by the note's most recent edit `timestamp` (ISO-8601
 /// strings sort lexicographically when zero-padded). Notes whose edits all
 /// have empty/unparseable timestamps are skipped.
-fn compact_old_notes(git: &Git, ref_name: &str, dry_run: bool) -> Result<u32, GitError> {
+fn compact_old_notes(git: &Git, ref_name: &str, dry_run: bool) -> Result<Vec<String>, GitError> {
     let store = NotesStore::new(git.clone(), ref_name);
     let entries = match store.list() {
         Ok(v) => v,
         Err(prov_core::storage::notes::NotesError::Git(e)) => return Err(e),
-        Err(prov_core::storage::notes::NotesError::Schema(_)) => return Ok(0),
+        Err(prov_core::storage::notes::NotesError::Schema(_)) => return Ok(Vec::new()),
     };
 
     // Cutoff in ISO-8601 form. Comparing strings is safe for properly-formatted
@@ -208,10 +257,10 @@ fn compact_old_notes(git: &Git, ref_name: &str, dry_run: bool) -> Result<u32, Gi
         u64::from(COMPACT_AGE_DAYS).saturating_mul(86_400),
     )) {
         Some(t) => system_time_to_iso8601(t),
-        None => return Ok(0),
+        None => return Ok(Vec::new()),
     };
 
-    let mut compacted = 0_u32;
+    let mut compacted: Vec<String> = Vec::new();
     for (sha, mut note) in entries {
         let newest = note
             .edits
@@ -240,13 +289,14 @@ fn compact_old_notes(git: &Git, ref_name: &str, dry_run: bool) -> Result<u32, Gi
         }
         if dry_run {
             println!("prov gc (dry-run, {ref_name}): would compact note {sha}");
+            compacted.push(sha);
             continue;
         }
         if let Err(e) = store.write(&sha, &note) {
             eprintln!("prov gc: rewriting compacted note {sha} on {ref_name} failed: {e}");
             continue;
         }
-        compacted = compacted.saturating_add(1);
+        compacted.push(sha);
     }
     Ok(compacted)
 }

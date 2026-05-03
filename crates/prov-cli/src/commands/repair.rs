@@ -16,17 +16,15 @@
 //! Both public and private notes refs are walked. Repair is idempotent — a
 //! second run is a no-op once orphans have been migrated.
 
-use std::collections::BTreeSet;
-
 use anyhow::{anyhow, Context};
 use clap::Parser;
+use serde::Serialize;
 
 use prov_core::git::{Git, GitError};
 use prov_core::storage::notes::NotesStore;
-use prov_core::storage::sqlite::Cache;
 use prov_core::storage::{NOTES_REF_PRIVATE, NOTES_REF_PUBLIC};
 
-use super::common::CACHE_FILENAME;
+use super::common::invalidate_cache_per_sha;
 
 #[derive(Parser, Debug)]
 pub struct Args {
@@ -43,6 +41,33 @@ pub struct Args {
     /// Print what would be migrated without writing.
     #[arg(long)]
     pub dry_run: bool,
+    /// Emit JSON instead of human-readable output. The Skill (U12) and other
+    /// agents depend on this to parse migration results without scraping.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Serialize)]
+struct RepairPair {
+    old: String,
+    new: String,
+    ref_name: &'static str,
+    /// One of: `migrated` (default), `would-migrate` (dry-run),
+    /// `skipped-existing` (new SHA already had a note),
+    /// `skipped-no-source` (old SHA had no orphan to migrate),
+    /// `failed` (write to new SHA errored — orphan kept).
+    status: &'static str,
+}
+
+#[derive(Serialize)]
+struct RepairJson {
+    migrated_public: u32,
+    migrated_private: u32,
+    pairs: Vec<RepairPair>,
+    days_walked: u32,
+    ref_walked: String,
+    dry_run: bool,
+    prov_version: &'static str,
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -56,14 +81,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let pairs = collect_rewrite_pairs(&git, &args.ref_name, args.days)
         .with_context(|| format!("walking {} reflog", args.ref_name))?;
 
-    if pairs.is_empty() {
-        println!(
-            "prov repair: no rewrite events in the last {} days on {}",
-            args.days, args.ref_name
-        );
-        return Ok(());
-    }
-
+    let mut report_pairs: Vec<RepairPair> = Vec::new();
     let mut migrated_public = 0_u32;
     let mut migrated_private = 0_u32;
     for ref_name in [NOTES_REF_PUBLIC, NOTES_REF_PRIVATE] {
@@ -75,6 +93,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             // Skip when the new SHA already has a note — the user (or a later
             // post-rewrite run) already migrated it. Don't clobber.
             if store.read(new).ok().flatten().is_some() {
+                report_pairs.push(RepairPair {
+                    old: old.clone(),
+                    new: new.clone(),
+                    ref_name,
+                    status: "skipped-existing",
+                });
                 continue;
             }
             // Look for the orphan on the old SHA. If absent, nothing to repair.
@@ -82,16 +106,38 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 continue;
             };
             if args.dry_run {
-                println!("prov repair (dry-run, {ref_name}): would migrate {old} → {new}");
+                report_pairs.push(RepairPair {
+                    old: old.clone(),
+                    new: new.clone(),
+                    ref_name,
+                    status: "would-migrate",
+                });
+                if !args.json {
+                    println!("prov repair (dry-run, {ref_name}): would migrate {old} → {new}");
+                }
                 continue;
             }
             if let Err(e) = store.write(new, &note) {
-                eprintln!("prov repair: write {new} on {ref_name} failed: {e} (orphan kept)");
+                report_pairs.push(RepairPair {
+                    old: old.clone(),
+                    new: new.clone(),
+                    ref_name,
+                    status: "failed",
+                });
+                if !args.json {
+                    eprintln!("prov repair: write {new} on {ref_name} failed: {e} (orphan kept)");
+                }
                 continue;
             }
             // Remove the source after a successful write. If this fails the
             // orphan stays, which is annoying but not corrupting.
             let _ = store.remove(old);
+            report_pairs.push(RepairPair {
+                old: old.clone(),
+                new: new.clone(),
+                ref_name,
+                status: "migrated",
+            });
             if ref_name == NOTES_REF_PUBLIC {
                 migrated_public = migrated_public.saturating_add(1);
             } else {
@@ -100,17 +146,31 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
-    if args.dry_run {
-        return Ok(());
-    }
-
-    if migrated_public + migrated_private > 0 {
+    if !args.dry_run && (migrated_public + migrated_private) > 0 {
         invalidate_cache_for(&git, &pairs);
     }
 
-    println!(
-        "prov repair: migrated {migrated_public} public + {migrated_private} private orphan note(s)"
-    );
+    if args.json {
+        let payload = RepairJson {
+            migrated_public,
+            migrated_private,
+            pairs: report_pairs,
+            days_walked: args.days,
+            ref_walked: args.ref_name.clone(),
+            dry_run: args.dry_run,
+            prov_version: env!("CARGO_PKG_VERSION"),
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if pairs.is_empty() {
+        println!(
+            "prov repair: no rewrite events in the last {} days on {}",
+            args.days, args.ref_name
+        );
+    } else if !args.dry_run {
+        println!(
+            "prov repair: migrated {migrated_public} public + {migrated_private} private orphan note(s)"
+        );
+    }
     Ok(())
 }
 
@@ -167,32 +227,30 @@ fn collect_rewrite_pairs(
 }
 
 fn is_rewrite_subject(subject: &str) -> bool {
-    // Match git's reflog subjects for rewrite-producing commands. `rebase` and
-    // `commit (amend)` are the load-bearing ones; `rebase -i` emits `rebase
-    // (pick)` / `(squash)` / `(fixup)` / `(finish)` per step.
-    subject.starts_with("rebase")
+    // Only the *terminal* events that produce a user-visible new SHA matter
+    // for repair. `rebase -i` also emits `rebase (start|pick|squash|fixup)`
+    // for each intermediate step; pairing those with the prior reflog entry
+    // would build (intermediate, intermediate) pairs and — if a note happens
+    // to be attached to an intermediate SHA — migrate it onto an unrelated
+    // commit that `prov gc` would later cull.
+    //
+    // post-rewrite already handles per-step migration during a normal rebase;
+    // repair only needs to cover the bypass case (different shell, custom
+    // GIT_DIR, --no-verify), and those bypasses still produce the terminal
+    // events below. Narrowing here costs us nothing in the supported cases.
+    subject.starts_with("rebase (finish)")
         || subject.starts_with("commit (amend)")
         || subject.starts_with("commit(amend)")
 }
 
 fn invalidate_cache_for(git: &Git, pairs: &[(String, String)]) {
-    let cache_path = git.git_dir().join(CACHE_FILENAME);
-    if !cache_path.exists() {
-        return;
-    }
-    let Ok(mut cache) = Cache::open(&cache_path) else {
-        return;
-    };
+    use std::collections::BTreeSet;
     let mut touched: BTreeSet<&str> = BTreeSet::new();
     for (o, n) in pairs {
         touched.insert(o.as_str());
         touched.insert(n.as_str());
     }
-    for sha in &touched {
-        let _ = cache.delete_note(sha);
-    }
-    let public = NotesStore::new(git.clone(), NOTES_REF_PUBLIC);
-    let _ = cache.set_recorded_notes_ref_sha(public.ref_sha().ok().flatten().as_deref());
+    invalidate_cache_per_sha(git, touched);
 }
 
 #[cfg(test)]
@@ -201,13 +259,17 @@ mod tests {
 
     #[test]
     fn rewrite_subjects_classified() {
-        assert!(is_rewrite_subject("rebase (start): checkout main"));
-        assert!(is_rewrite_subject("rebase (pick): foo"));
-        assert!(is_rewrite_subject("rebase (squash): bar"));
+        // Only terminal events that produce a user-visible new SHA — the
+        // intermediate `rebase (pick)` / `(squash)` / `(start)` events are
+        // post-rewrite's job, not repair's.
         assert!(is_rewrite_subject(
             "rebase (finish): returning to refs/heads/x"
         ));
         assert!(is_rewrite_subject("commit (amend): tweak"));
+
+        assert!(!is_rewrite_subject("rebase (start): checkout main"));
+        assert!(!is_rewrite_subject("rebase (pick): foo"));
+        assert!(!is_rewrite_subject("rebase (squash): bar"));
         assert!(!is_rewrite_subject("commit: regular"));
         assert!(!is_rewrite_subject("checkout: moving from a to b"));
     }

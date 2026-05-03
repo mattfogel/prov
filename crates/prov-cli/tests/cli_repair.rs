@@ -353,3 +353,60 @@ fn gc_compact_skips_recent_notes() {
         Some("keep me")
     );
 }
+
+#[test]
+fn gc_compact_skips_notes_with_empty_timestamps() {
+    // Notes whose edits all carry empty timestamps must not be compacted —
+    // there's no way to compare them against the cutoff. Older versions
+    // would have routed them through compaction anyway because the empty
+    // string compares lexicographically below any real ISO date.
+    let tmp = init_repo();
+    let root = tmp.path();
+    let head = make_commit(root, "v1\n", "init");
+
+    let git = Git::discover(root).unwrap();
+    let store = NotesStore::new(git, NOTES_REF_PUBLIC);
+    let mut edit = make_edit("no timestamp", "");
+    edit.preceding_turns_summary = Some("untouched".into());
+    store.write(&head, &Note::new(vec![edit])).unwrap();
+
+    prov_in(root).args(["gc", "--compact"]).assert().success();
+
+    let after = store.read(&head).unwrap().unwrap();
+    assert_eq!(
+        after.edits[0].preceding_turns_summary.as_deref(),
+        Some("untouched")
+    );
+}
+
+#[test]
+fn gc_preserves_notes_for_detached_head_commits() {
+    // Regression: `prov gc` previously called `for-each-ref --contains <sha>`
+    // alone, which returns empty for commits reachable only via detached HEAD.
+    // The user's WIP debug commit's note would be silently culled.
+    let tmp = init_repo();
+    let root = tmp.path();
+    let _seed = make_commit(root, "seed\n", "seed");
+
+    // Create a commit, then detach HEAD to it (no branch points at it).
+    let detached_sha = make_commit(root, "wip\n", "wip on detached HEAD");
+    run_git(root, &["checkout", "-q", "--detach", &detached_sha]);
+    // Move main back so the only path to detached_sha is via reflog/HEAD.
+    run_git(root, &["update-ref", "refs/heads/main", "HEAD~"]);
+
+    let git = Git::discover(root).unwrap();
+    let store = NotesStore::new(git, NOTES_REF_PUBLIC);
+    store
+        .write(
+            &detached_sha,
+            &Note::new(vec![make_edit("wip prompt", "2026-04-28T12:00:00Z")]),
+        )
+        .unwrap();
+
+    prov_in(root).args(["gc"]).assert().success();
+
+    assert!(
+        store.read(&detached_sha).unwrap().is_some(),
+        "detached-HEAD note was culled — reflog reachability fallback failed"
+    );
+}

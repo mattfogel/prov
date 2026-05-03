@@ -64,3 +64,33 @@ impl RepoHandles {
         Resolver::new(self.git, self.notes, self.cache)
     }
 }
+
+/// Drop the cache rows for `touched_shas` and re-stamp the recorded public
+/// notes-ref SHA. Used by every command that mutates the notes ref outside
+/// the post-commit happy path (`prov hook post-rewrite`, `prov repair`).
+///
+/// Best-effort: any sub-step failure is swallowed. The cache is a derived
+/// view; the worst outcome is a cold reindex on the next read. Cache file
+/// missing → no-op. Re-stamp uses `Ok(Some(sha))` only — a transient git
+/// failure leaves the prior stamp alone rather than wiping it (which would
+/// force an unnecessary cold reindex even though the notes ref migrated
+/// correctly).
+pub fn invalidate_cache_per_sha<'a, I>(git: &Git, touched_shas: I)
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let cache_path = git.git_dir().join(CACHE_FILENAME);
+    if !cache_path.exists() {
+        return;
+    }
+    let Ok(mut cache) = Cache::open(&cache_path) else {
+        return;
+    };
+    for sha in touched_shas {
+        let _ = cache.delete_note(sha);
+    }
+    let public = NotesStore::new(git.clone(), NOTES_REF_PUBLIC);
+    if let Ok(Some(sha)) = public.ref_sha() {
+        let _ = cache.set_recorded_notes_ref_sha(Some(&sha));
+    }
+}
