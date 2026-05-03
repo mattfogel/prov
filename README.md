@@ -16,9 +16,9 @@ Prov captures the prompt-and-conversation context behind every Claude-Code-drive
 
 Prov is an open-source tool I'm building because I want it to exist. **It is not a product.** No telemetry, no hosted service, no signups, no paid tier — and no commitment to a roadmap beyond what fits in nights-and-weekends maintenance.
 
-[Git AI](https://usegitai.com/) shipped first with a near-identical core architecture: per-line AI authorship in git notes, SQLite cache, rewrite preservation, multi-agent attribution. Prov is not novel on storage. The honest differentiators are:
+Other tools have shipped with similar core architecture: per-line AI authorship in git notes, SQLite cache, rewrite preservation, multi-agent attribution. Prov is not novel on storage. The honest differentiators are:
 
-- **Agent-first via the Claude Code Skill.** No equivalent surface in Git AI today. Giving an agent access to its own prior reasoning is a different category of capability — not just better tooling for humans, but better continuity across sessions.
+- **Agent-first via the Claude Code Skill.** No equivalent surface today. Giving an agent access to its own prior reasoning is a different category of capability — not just better tooling for humans, but better continuity across sessions.
 - **PR intent timeline as a review artifact.** A single sticky comment on each PR that walks the conversation chronologically — superseded turns collapsed, files-touched listed per turn — rather than per-line annotations.
 - **Redactor-by-default-when-shared.** Notes are local-only out of the box; opting in to team sharing (`prov sync enable origin`) turns on a write-time secret-detector pipeline plus a pre-push gate. The redaction story matters when you choose to share.
 

@@ -18,7 +18,7 @@ Build Prov v1 as a Rust CLI plus a Claude Code Plugin (bundling hooks and a Skil
 
 Code is increasingly written by AI, but the systems that explain code (git blame, commit messages, code comments) assume the person whose name is on the change is also the person who reasoned about it. With AI-generated code that assumption is broken: the reasoning lives in a chat conversation that is, weeks later, effectively unrecoverable. This bites four moments of pain — code review (reviewers reviewing the artifact without intent), incident response ("you wrote this 3 weeks ago" — but you don't remember why), refactoring (Chesterton's fences accumulate at AI velocities), and AI agents working on AI-written code (no continuity across sessions). The original brief framing is preserved; this plan covers a v1 implementation against that frame.
 
-**Honest positioning vs prior art.** [Git AI](https://usegitai.com/) shipped v1.0 in late 2025 with a near-identical core architecture: per-line AI authorship in git notes, SQLite cache, rewrite preservation, multi-agent attribution. Prov is **not** novel on storage — claiming so would be dishonest. Real differentiators that hold up: (a) push-by-default with redaction (Git AI keeps transcripts local), (b) agent-first via the Claude Code Skill (no equivalent surface in Git AI), (c) the PR intent timeline as a review-time artifact rather than per-line annotations. Position Prov as the "agent-native + team-shareable" entry, and treat Git AI interop as an open question for v1.1.
+**Honest positioning vs prior art.** Other tools have shipped with similar core architecture: per-line AI authorship in git notes, SQLite cache, rewrite preservation, multi-agent attribution. Prov is **not** novel on storage — claiming so would be dishonest. Real differentiators that hold up: (a) push-by-default with redaction, (b) agent-first via the Claude Code Skill, (c) the PR intent timeline as a review-time artifact rather than per-line annotations. Position Prov as the "agent-native + team-shareable" entry, and treat interop as an open question for v1.1.
 
 ---
 
@@ -61,7 +61,6 @@ Code is increasingly written by AI, but the systems that explain code (git blame
 - **Automated/gated Skill triggering** (v1.x): v1 enforces "only on substantive edits to files with existing provenance" through Skill prose. A real triggering policy (e.g., file globs in `paths:`, edit-size thresholds) is a v1.x iteration informed by user feedback.
 - **Per-conversation grouping in the GitHub Action** (v1.x): v1 groups by `session_id`. Multi-conversation grouping (multiple PRs from the same conversation, or multiple authors) is deferred.
 - **Backfill quality threshold tuning** (v1.x): v1 surfaces every backfilled note with an `(approximate)` marker. Confidence scoring and threshold cutoffs come after real-world feedback.
-- **Git AI notes-format interop** (v1.1): if Git AI's schema is stable enough, Prov could read its notes for cross-tool continuity. Out of v1 scope — needs a real interop conversation with that project first.
 - **Notarized macOS binaries** (v1.1): v1 ships unsigned with `xattr` workaround documented. Add notarization if user friction is real.
 
 ---
@@ -89,7 +88,6 @@ None — `prov/docs/solutions/` does not exist yet. As v1 ships, capture lessons
 - **Claude Code hooks reference**: <https://code.claude.com/docs/en/hooks> and <https://code.claude.com/docs/en/hooks.md> — payload schemas, registration, scoping.
 - **Claude Code skills reference**: <https://code.claude.com/docs/en/skills> — SKILL.md frontmatter, discovery, auto-activation via `paths:`.
 - **Claude Code plugins reference**: <https://code.claude.com/docs/en/plugins> — `.claude-plugin/plugin.json` shape, `hooks/hooks.json`, `skills/<name>/SKILL.md`, marketplace install.
-- **Git AI (prior art)**: <https://usegitai.com/>, <https://github.com/git-ai-project/git-ai>, <https://usegitai.com/docs/how-git-ai-works> — the existing leader in this space.
 - **Git notes operational guide**: <https://git-scm.com/docs/git-notes>, <https://tylercipriani.com/blog/2022/11/19/git-notes-gits-coolest-most-unloved-feature/>, <https://www.codestudy.net/blog/git-how-to-push-messages-added-by-git-notes-to-the-central-git-server/>.
 - **post-rewrite hook reference**: <https://git-scm.com/docs/githooks>.
 - **Notes merge driver precedent**: <https://github.com/Praqma/git-merge-driver>.
@@ -140,7 +138,6 @@ None — `prov/docs/solutions/` does not exist yet. As v1 ships, capture lessons
 - **Skill triggering precision** (open question 3 from the brief): Prose-only gating in v1. Real triggering policy emerges from user feedback in v1.x.
 - **Action — handling PRs with multiple Claude Code conversations from different authors**: v1 groups strictly by `session_id`. Cross-author multi-conversation rendering is deferred.
 - **Anthropic API key handling for `prov regenerate`**: Use `ANTHROPIC_API_KEY` env var; fail explicitly if absent. Storing keys, key rotation, and rate-limit backoff are deferred to v1.x.
-- **Git AI notes-format interop**: Worth a real conversation with that project before committing. v1 defines its own schema; v1.1 may add a reader.
 - **Compaction at 90 days**: brief proposes dropping `preceding_turns_summary` for old notes. Implementation as a `prov gc --compact` flag, default off in v1; turn on once storage growth is observed in real use.
 
 ### Deferred from Document Review (2026-04-28)
@@ -152,7 +149,7 @@ These were surfaced by the post-write document review and deferred for explicit 
 - **Push posture: INVERTED to local-only by default.** Notes do NOT push automatically. `prov install` does NOT configure a remote-side fetch refspec, does NOT install the pre-push gate as a global hook, and does NOT auto-push on `git push`. `prov push <remote>` becomes an explicit opt-in command that the user runs deliberately. `prov install --enable-push <remote>` (or post-install `prov sync enable <remote>`) is what configures the refspec, registers the pre-push gate, and turns on team mode. The redactor still runs at write-time (defense in depth — local notes should still be scrubbed in case the user opts in later or pushes ad-hoc). The pre-push gate still runs whenever `prov push` is invoked or when push is enabled. **Implementer note:** when implementing U5/U7/U8, treat the existing approach sections as describing "team-mode behavior" — the install steps that wire push happen only on `--enable-push` or `prov sync enable`. Update README positioning to remove "push-by-default with redaction" from the differentiators list; the wedge becomes "agent-first via Skill + PR intent timeline + redactor-by-default-when-shared" (a softer claim that doesn't require betting the product on a single false negative).
 - **Skill triggering:** Prose-only gating with the narrowed `paths:` default and `--only-if-substantial` CLI flag stays as-is. Real policy in v1.x.
 
-- **Push-by-default — invert or defend?** The single most differentiated wedge claim ("push-by-default with redaction") is also the highest-rated risk in the Risks table (a single redactor false-negative leaks secrets to a remote and ends project credibility). Git AI's local-only posture exists precisely because that bet is hard to win. Resolve by either (a) gathering concrete user evidence that team-shared notes drive v1 adoption, or (b) inverting the default — ship local-only in v1, make `prov push` opt-in per-repo, treat shared notes as a v1.x feature once the redactor has a regression corpus from real use. Either resolution is defensible; the current plan picks (a) without naming the evidence. *(product-lens, P1)*
+- **Push-by-default — invert or defend?** The single most differentiated wedge claim ("push-by-default with redaction") is also the highest-rated risk in the Risks table (a single redactor false-negative leaks secrets to a remote and ends project credibility). Other tools' local-only posture exists precisely because that bet is hard to win. Resolve by either (a) gathering concrete user evidence that team-shared notes drive v1 adoption, or (b) inverting the default — ship local-only in v1, make `prov push` opt-in per-repo, treat shared notes as a v1.x feature once the redactor has a regression corpus from real use. Either resolution is defensible; the current plan picks (a) without naming the evidence. *(product-lens, P1)*
 
 - **Agent-first wedge depends on deferred Skill triggering policy.** R11 / U12 names the Skill as one of three claimed differentiators, but its triggering is "prose-only in v1" with policy deferred to v1.x. If the agent over-queries (latency/noise on every edit) or under-queries (silent failure), the wedge collapses — and v1 ships with no automated way to know which is happening. Decide whether to (a) move basic policy gating (file globs + edit-size threshold beyond what was applied here) into v1 so trigger behavior is testable, or (b) downgrade the Skill from "real differentiator" to "experimental surface" in the README until v1.x lands real triggering. *(product-lens, P1)*
 
@@ -429,7 +426,7 @@ A single developer can install Prov, run Claude Code in their repo, commit chang
 - `prov-cli` uses `clap` with derive macros for command parsing; `main.rs` dispatches subcommands defined in `commands/`.
 - `prov-core` exposes the public API (resolver, schema types, storage traits) and re-exports nothing from `prov-cli`.
 - Verify: `cargo search prov`, `gh search repos prov`, `brew search prov`, `npm view prov` — confirm namespace availability or document the fallback (`prov-cli` crate name with `prov` binary name via `[[bin]] name = "prov"`).
-- README skeleton states posture explicitly: not a product, no telemetry, Apache 2.0, Git AI is the prior art and Prov differs by being agent-first + push-by-default + redacted.
+- README skeleton states posture explicitly: not a product, no telemetry, Apache 2.0, prior art and Prov differs by being agent-first + push-by-default + redacted.
 
 **Patterns to follow:**
 - Cargo workspace conventions in any well-maintained Rust monorepo (e.g., ripgrep, fd).
@@ -1085,7 +1082,6 @@ The Skill makes Claude Code aware of its own past reasoning; the GitHub Action g
 | Notes merge driver gap (v1 ships with `manual` only) frustrates teams | Medium | Medium | Document `prov notes resolve` clearly; v1.1 adds custom merge driver. |
 | Pre-push gate has a false negative (secret slips through) | Low | Critical (secrets leak to remote) | Defense-in-depth: write-time redactor is the primary; pre-push is the second line; `prov redact-history` can scrub retroactively. Add a curated regression corpus that grows with reported escapes. |
 | Pre-push gate has a high false positive rate (blocks innocent pushes) | Medium | Medium (user trust erosion) | Each detector ships with a confidence test against a "natural prose" corpus before going live. `--no-verify` always available. |
-| Git AI ships a breaking interop format change while we're building | Low | Medium | Don't claim format compat in v1; defer interop to v1.1 conversation. |
 | Plugin install via marketplace unavailable (user's harness too old) | Medium | Low | Project-scope install is the documented escape hatch; works on every Claude Code version that supports `.claude/settings.json` hooks. |
 | `git blame -C -M` performance regression on huge files | Low | Medium | Cache blame results in SQLite keyed by `(file, blob_sha)`; recompute only on file-content change. |
 | Storage growth at high-frequency-Claude-Code teams | Medium | Medium | 90-day compaction (`prov gc --compact`); encourage `git gc --aggressive` periodically; document expected growth (low MB/year per active dev). |
@@ -1096,7 +1092,7 @@ The Skill makes Claude Code aware of its own past reasoning; the GitHub Action g
 
 ## Documentation Plan
 
-- **README.md** is the marketing — explain the problem, position vs Git AI honestly, show the agent-first angle, cover install for all three surfaces, walk through "what does it actually do" with screenshots.
+- **README.md** is the marketing — explain the problem, position, show the agent-first angle, cover install for all three surfaces, walk through "what does it actually do" with screenshots.
 - **`docs/install.md`** — step-by-step for binary install, `prov install`, plugin install, GitHub Action enablement.
 - **`docs/privacy.md`** — the redaction model, the `# prov:private` opt-out (case-insensitive matching, first/last-line-only restriction), `.provignore` syntax, what gets pushed and what doesn't, how to scrub retroactively, and the **incident-response playbook** for when a secret is discovered in pushed notes (including the explicit caveat that `prov redact-history` is a local-and-future-clone scrub only — the underlying secret MUST be rotated independently). Also documents the threat model around the pre-push gate's `--no-verify` bypass and the audit-log entry the gate emits when bypassed.
 - **`docs/architecture.md`** — capture pipeline, storage, resolver, with the High-Level Technical Design diagrams from this plan.
@@ -1134,7 +1130,6 @@ The Skill makes Claude Code aware of its own past reasoning; the GitHub Action g
 - Claude Code hooks: <https://code.claude.com/docs/en/hooks>, <https://code.claude.com/docs/en/hooks.md>
 - Claude Code skills: <https://code.claude.com/docs/en/skills>
 - Claude Code plugins: <https://code.claude.com/docs/en/plugins>
-- Git AI (prior art): <https://usegitai.com/>, <https://github.com/git-ai-project/git-ai>
 - Git notes documentation: <https://git-scm.com/docs/git-notes>
 - Tyler Cipriani on git notes UX: <https://tylercipriani.com/blog/2022/11/19/git-notes-gits-coolest-most-unloved-feature/>
 - Pushing git notes operationally: <https://www.codestudy.net/blog/git-how-to-push-messages-added-by-git-notes-to-the-central-git-server/>
