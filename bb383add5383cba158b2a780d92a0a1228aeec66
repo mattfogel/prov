@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "edits": [
+    {
+      "file": "crates/prov-cli/tests/cli_repair.rs",
+      "line_range": [
+        300,
+        300
+      ],
+      "content_hashes": [
+        "c37737f7570690deff3f642616f98b1107d4fb7dc20ea9a934c74ea2871667be"
+      ],
+      "prompt": "so i updated our version number in the cargo.toml and also set the rust version to 1.95. don't know if that cuased it, but now we get a clippy error when i run check.sh",
+      "conversation_id": "6951ab95-9c76-4813-a2e4-5f55553dbe97",
+      "turn_index": 0,
+      "tool_use_id": "toolu_01NrtZpn6Sh64oM8Yjgc6cLi",
+      "model": "claude-opus-4-7[1m]",
+      "tool": "claude-code",
+      "timestamp": "2026-05-03T18:47:21Z"
+    },
+    {
+      "file": "crates/prov-cli/tests/cli_repair.rs",
+      "line_range": [
+        298,
+        299
+      ],
+      "content_hashes": [
+        "982488dc725c0bfcc163ad28a31306dc72897d3e66ec027b99e577e165930b98",
+        "ecf23c9f64a333376c30a7c67b02b85c9c7ded0cb31550f20b9143fcd524eb92"
+      ],
+      "prompt": "yes",
+      "conversation_id": "6951ab95-9c76-4813-a2e4-5f55553dbe97",
+      "turn_index": 1,
+      "tool_use_id": "toolu_01N7t7vL9VCRDUT5ycJM5qw9",
+      "model": "claude-opus-4-7[1m]",
+      "tool": "claude-code",
+      "timestamp": "2026-05-03T18:48:08Z"
+    }
+  ]
+}
