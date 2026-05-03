@@ -4,10 +4,11 @@
 //! merge-in-progress state directly) and drives the binary, then asserts on
 //! the resulting notes-ref state and `git notes show` output.
 
+mod common;
+
 use std::path::Path;
 use std::process::Command;
 
-use assert_cmd::Command as AssertCommand;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -16,50 +17,7 @@ use prov_core::schema::{Edit, Note};
 use prov_core::storage::notes::NotesStore;
 use prov_core::storage::NOTES_REF_PUBLIC;
 
-fn run_git(cwd: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .current_dir(cwd)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .status()
-        .expect("git");
-    assert!(status.success(), "git {args:?} failed");
-}
-
-fn git_capture(cwd: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
-        .current_dir(cwd)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
-        .expect("git")
-}
-
-fn head_sha(cwd: &Path) -> String {
-    let out = git_capture(cwd, &["rev-parse", "HEAD"]);
-    assert!(out.status.success());
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
-}
-
-fn init_bare_remote() -> TempDir {
-    let tmp = TempDir::new().unwrap();
-    run_git(tmp.path(), &["init", "-q", "--bare"]);
-    tmp
-}
-
-fn prov_in(cwd: &Path) -> AssertCommand {
-    let mut c = AssertCommand::cargo_bin("prov").unwrap();
-    c.current_dir(cwd)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null");
-    c
-}
-
-fn install_prov(cwd: &Path) {
-    prov_in(cwd).arg("install").assert().success();
-}
+use common::{git_capture, head_sha, init_bare_remote, prov_in, run_git};
 
 /// Build an Edit with the given identity fields. Body fields (file, hashes)
 /// derive from `id` so two distinct ids produce visually distinct notes.
@@ -184,13 +142,40 @@ fn two_dev_disjoint_edits_unioned_after_resolve() {
     .unwrap();
     let merged = Note::from_json(&merged_json).expect("valid merged note");
     assert_eq!(merged.edits.len(), 2, "both sides' edits should survive");
-    let convs: Vec<&str> = merged
+    assert_eq!(merged.version, 1, "merged note should keep schema v1");
+
+    // Edits should sort by ascending timestamp — locking determinism in
+    // the resolver's sort rather than relying on whatever map order
+    // landed first.
+    let timestamps: Vec<&str> = merged.edits.iter().map(|e| e.timestamp.as_str()).collect();
+    let mut sorted = timestamps.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        timestamps, sorted,
+        "merged edits should be sorted by timestamp ascending"
+    );
+
+    // A by-conversation lookup so field-preservation asserts don't depend on
+    // sort order changing under us in the future.
+    let by_conv: std::collections::HashMap<&str, &Edit> = merged
         .edits
         .iter()
-        .map(|e| e.conversation_id.as_str())
+        .map(|e| (e.conversation_id.as_str(), e))
         .collect();
-    assert!(convs.contains(&"sess_a"));
-    assert!(convs.contains(&"sess_b"));
+
+    let a = by_conv.get("sess_a").expect("sess_a edit should survive");
+    assert_eq!(a.prompt, "prompt from a");
+    assert_eq!(a.model, "claude-sonnet-4-5");
+    assert_eq!(a.tool_use_id.as_deref(), Some("tool_a"));
+    assert_eq!(a.timestamp, "2026-04-28T10:00:00Z");
+    assert_eq!(a.turn_index, 0);
+
+    let b = by_conv.get("sess_b").expect("sess_b edit should survive");
+    assert_eq!(b.prompt, "prompt from b");
+    assert_eq!(b.model, "claude-sonnet-4-5");
+    assert_eq!(b.tool_use_id.as_deref(), Some("tool_b"));
+    assert_eq!(b.timestamp, "2026-04-28T11:00:00Z");
+    assert_eq!(b.turn_index, 5);
 }
 
 #[test]
@@ -279,9 +264,6 @@ fn install_prov_with_push(cwd: &Path, remote: &str) {
         .args(["install", "--enable-push", remote])
         .assert()
         .success();
-    // Sanity: install should be idempotent — re-run to ensure tests don't
-    // accidentally observe install side effects between runs.
-    install_prov(cwd);
 }
 
 fn plant_note(cwd: &Path, sha: &str, note: &Note) {

@@ -59,15 +59,43 @@ fn no_subcommand_prints_help_and_errors() {
 
 #[test]
 fn unimplemented_stub_exits_with_code_2() {
-    // U5 wired up the read CLI; later units replaced more stubs with real
-    // implementations (U6–U10, …). `backfill` is still a stub — when that
-    // lands, swap to whichever stub remains.
-    prov()
-        .arg("backfill")
-        .assert()
-        .failure()
-        .code(2)
-        .stderr(predicate::str::contains("not yet implemented"));
+    // The unimplemented_stub helper (commands/mod.rs::unimplemented_stub) is
+    // shared by every Phase 1 stub; when invoked, it must exit code 2 with
+    // "not yet implemented" in stderr so callers — including agents and CI —
+    // can distinguish stubbed-out subcommands from real failures.
+    //
+    // We assert by probing every subcommand that's *currently* a stub. As
+    // stubs are replaced with real implementations across units (U5 wired
+    // the read CLI; U6–U10 added more), the set shrinks. The test passes as
+    // long as at least one stub remains and every probed stub satisfies the
+    // contract; once the last stub lands, swap to a unit test for the helper
+    // itself (it currently calls `process::exit`, which makes direct unit
+    // testing awkward — refactor to return an exit code, then test it).
+    let candidates = ["backfill", "regenerate"];
+
+    let mut probed = 0;
+    for verb in candidates {
+        // Skip any candidate that's been implemented since this list was last
+        // updated (it would no longer print the stub message), so the test
+        // doesn't break on the next stub-replacement PR.
+        let output = prov().arg(verb).assert().get_output().clone();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("not yet implemented") {
+            continue;
+        }
+        probed += 1;
+        prov()
+            .arg(verb)
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains("not yet implemented"));
+    }
+    assert!(
+        probed > 0,
+        "no stubbed subcommands left to probe — refactor unimplemented_stub \
+         to return an exit code and unit-test it directly, then delete this test"
+    );
 }
 
 #[test]

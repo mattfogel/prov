@@ -9,15 +9,19 @@
 //!
 //! This command does the JSON-aware merge: parse both sides as `Note`, union
 //! their `edits[]`, dedupe by `(conversation_id, turn_index, tool_use_id)`
-//! (falling back to a content-hash digest when `tool_use_id` is `None` on both
-//! sides), keep the entry with the later `timestamp` on collision, sort the
-//! result by `timestamp`, write it back, and finalize. Two devs annotating
+//! (falling back to `(file, line_range)` when `tool_use_id` is `None` on both
+//! sides — same shape as `hook.rs::dedupe_and_sort_edits` so the two dedupers
+//! stay in sync), keep the entry with the later `timestamp` on collision, sort
+//! the result by `timestamp`, write it back, and finalize. Two devs annotating
 //! different turns produce a merged note containing both turns; the impossible
 //! case where both annotated the same `tool_use_id` keeps the later one rather
 //! than dropping data silently.
 //!
-//! Schema-version mismatch on either side aborts before any write so a v1
-//! reader does not fabricate a v2-shaped union.
+//! Schema-version mismatch on either side aborts the current file before any
+//! write so a v1 reader does not fabricate a v2-shaped union. Across multiple
+//! conflict files, an abort on file N leaves files 1..N-1 already rewritten
+//! on disk; rerunning `prov notes-resolve` revalidates and finalizes correctly
+//! because resolved files round-trip cleanly through the no-marker branch.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -53,6 +57,15 @@ pub fn run(_args: Args) -> anyhow::Result<()> {
     let conflict_files = collect_conflict_files(&worktree_path)
         .with_context(|| format!("walking {}", worktree_path.display()))?;
 
+    // Resolve the actual ref being merged so user-facing error messages can
+    // point at the right `git notes --ref=<X> merge --abort` to back out. The
+    // success-path `--commit` below deliberately omits `--ref` so the resolver
+    // works for any future ref a user might be merging (e.g. someone manually
+    // merging into `refs/notes/prompts-private`); the abort hint should track
+    // that same ref rather than hardcoding `prompts`.
+    let target_ref =
+        read_merge_target_ref(&merge_ref_path).unwrap_or_else(|| NOTES_REF_PUBLIC.into());
+
     let mut resolved_shas: Vec<String> = Vec::new();
     for path in &conflict_files {
         let body =
@@ -61,7 +74,7 @@ pub fn run(_args: Args) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow!("could not derive commit SHA from {}", path.display()))?;
 
         let merged_json = if let Some((local_json, incoming_json)) = split_conflict(&body) {
-            merge_note_pair(&sha, &local_json, &incoming_json)?
+            merge_note_pair(&sha, &target_ref, &local_json, &incoming_json)?
         } else {
             // No conflict markers: the file is either already a clean
             // resolution the user wrote, or git auto-merged this slot but
@@ -76,6 +89,19 @@ pub fn run(_args: Args) -> anyhow::Result<()> {
         resolved_shas.push(sha);
     }
 
+    let count = conflict_files.len();
+    // Surface the silent-finalize edge case before deferring to git: if
+    // NOTES_MERGE_REF is set but no conflict files were found in
+    // NOTES_MERGE_WORKTREE (resolver killed mid-loop, partial cleanup, etc.),
+    // git's behavior with `--commit` is version-dependent. Warn the user so
+    // an inconsistent state isn't masked by a bland success message.
+    if count == 0 {
+        eprintln!(
+            "warning: no conflict files found in NOTES_MERGE_WORKTREE; \
+             merge may be in inconsistent state"
+        );
+    }
+
     // `git notes merge --commit` infers the target ref from `NOTES_MERGE_REF`
     // — passing `--ref` here would force a specific ref and silently break
     // resolution for any future ref a user might be merging (e.g. someone
@@ -85,12 +111,10 @@ pub fn run(_args: Args) -> anyhow::Result<()> {
 
     invalidate_cache_per_sha(&git, resolved_shas.iter().map(String::as_str));
 
-    let count = conflict_files.len();
-    let target = read_merge_target_ref(&merge_ref_path).unwrap_or_else(|| NOTES_REF_PUBLIC.into());
     if count == 0 {
-        println!("prov notes-resolve: finalized {target} (no conflicts to merge)");
+        println!("prov notes-resolve: finalized {target_ref} (no conflicts to merge)");
     } else {
-        println!("prov notes-resolve: finalized {target} ({count} conflict(s) merged)");
+        println!("prov notes-resolve: finalized {target_ref} ({count} conflict(s) merged)");
     }
     Ok(())
 }
@@ -141,7 +165,16 @@ fn sha_from_worktree_path(root: &Path, file: &Path) -> Option<String> {
 }
 
 /// Split a conflict-marked file into the local and incoming JSON bodies.
-/// Returns `None` when the file lacks markers (already resolved).
+///
+/// Returns `Some((local, incoming))` when conflict markers were present, or
+/// `None` when the file lacks markers entirely (already resolved by git or
+/// the user; the caller validates it parses as a v1 note).
+///
+/// `git notes merge`'s textual diff leaves matching prefix and suffix lines
+/// *outside* the conflict markers when the JSON is pretty-printed (e.g. the
+/// shared `{`, `"version": 1,`, `}`); those lines genuinely belong to both
+/// sides, so this function appends them to both buffers. That's intentional,
+/// not defensive — without it, neither side would parse as valid JSON.
 fn split_conflict(body: &str) -> Option<(String, String)> {
     let mut local = String::new();
     let mut incoming = String::new();
@@ -166,9 +199,11 @@ fn split_conflict(body: &str) -> Option<(String, String)> {
                     incoming.push('\n');
                 }
                 ConflictState::Outside => {
-                    // Content outside the conflict block belongs to both sides
-                    // (git's manual strategy doesn't normally emit any, but be
-                    // defensive — append to both so neither loses context).
+                    // git's diff3-style merge places shared prefix/suffix
+                    // (matching JSON braces, version field, etc.) OUTSIDE the
+                    // markers — those lines genuinely belong to both sides.
+                    // Appending them to both buffers reconstructs each side's
+                    // original full body so the JSON parser sees a valid note.
                     local.push_str(line);
                     local.push('\n');
                     incoming.push_str(line);
@@ -191,16 +226,28 @@ enum ConflictState {
 }
 
 /// Merge two note JSON bodies. Schema-version mismatch on either side aborts
-/// rather than fabricating a union shaped after one side's schema.
-fn merge_note_pair(sha: &str, local_json: &str, incoming_json: &str) -> anyhow::Result<String> {
-    let local = parse_note_with_context(sha, "local", local_json)?;
-    let incoming = parse_note_with_context(sha, "incoming", incoming_json)?;
+/// rather than fabricating a union shaped after one side's schema. `target_ref`
+/// is the notes ref currently being merged (read from `NOTES_MERGE_REF`); it
+/// is woven into user-facing error messages so the suggested
+/// `git notes --ref=<X> merge --abort` matches the actual ref in flight rather
+/// than hardcoding `prompts`.
+fn merge_note_pair(
+    sha: &str,
+    target_ref: &str,
+    local_json: &str,
+    incoming_json: &str,
+) -> anyhow::Result<String> {
+    let local = parse_note_with_context(sha, target_ref, "local", local_json)?;
+    let incoming = parse_note_with_context(sha, target_ref, "incoming", incoming_json)?;
 
+    // Defensive: dead today since `Note::from_json` rejects mismatched
+    // versions before we get here. Kept for future schema-range support
+    // (e.g. accepting v1+v2 reads through the same parser).
     if local.version != incoming.version {
         return Err(anyhow!(
             "schema version mismatch on {sha}: local v{local_v} vs incoming v{incoming_v} \
              (this build supports v{SCHEMA_VERSION}); aborting merge to avoid corrupting either side. \
-             Run `git notes --ref=prompts merge --abort` and upgrade prov before retrying.",
+             Run `git notes --ref={target_ref} merge --abort` and upgrade prov before retrying.",
             local_v = local.version,
             incoming_v = incoming.version,
         ));
@@ -218,13 +265,18 @@ fn merge_note_pair(sha: &str, local_json: &str, incoming_json: &str) -> anyhow::
     }
 
     let mut edits: Vec<Edit> = merged.into_values().collect();
-    // Stable sort by (timestamp, conversation_id, turn_index) so two edits
-    // sharing a timestamp don't reorder run-to-run on the same input.
+    // Stable sort by (timestamp, conversation_id, turn_index, tool_use_id) so
+    // two edits sharing the leading keys don't reorder run-to-run on the same
+    // input. The `tool_use_id` tiebreaker locks determinism in the sort itself
+    // rather than relying on the upstream BTreeMap's iteration order — a
+    // future swap to HashMap (or any other unordered collection) would
+    // otherwise silently break ordering.
     edits.sort_by(|a, b| {
         a.timestamp
             .cmp(&b.timestamp)
             .then_with(|| a.conversation_id.cmp(&b.conversation_id))
             .then_with(|| a.turn_index.cmp(&b.turn_index))
+            .then_with(|| a.tool_use_id.cmp(&b.tool_use_id))
     });
 
     let merged_note = Note::new(edits);
@@ -233,39 +285,63 @@ fn merge_note_pair(sha: &str, local_json: &str, incoming_json: &str) -> anyhow::
         .map_err(|e| anyhow!("serializing merged note for {sha}: {e}"))
 }
 
-fn parse_note_with_context(sha: &str, side: &str, json: &str) -> anyhow::Result<Note> {
+fn parse_note_with_context(
+    sha: &str,
+    target_ref: &str,
+    side: &str,
+    json: &str,
+) -> anyhow::Result<Note> {
     Note::from_json(json).map_err(|e| match e {
         SchemaError::UnknownVersion(v) => anyhow!(
             "{side} note for {sha} has schema version v{v}; this build of prov supports \
              v{SCHEMA_VERSION}. Aborting merge to avoid data loss; upgrade prov on this machine \
-             (or `git notes --ref=prompts merge --abort` to back out)."
+             (or `git notes --ref={target_ref} merge --abort` to back out)."
+        ),
+        SchemaError::MissingVersion => anyhow!(
+            "{side} note for {sha} is missing a 'version' field — likely truncated \
+             or malformed. Inspect with `git notes show {sha}` and abort the merge \
+             if needed (`git notes --ref={target_ref} merge --abort`)."
         ),
         other => anyhow!("{side} note for {sha} did not parse: {other}"),
     })
 }
 
-/// Dedup key for `edits[]`. `tool_use_id` is the strongest signal, but capture
-/// from older Claude Code builds may leave it `None`; in that case the joined
-/// `content_hashes` discriminate edits within the same turn so a shared
-/// `(conversation_id, turn_index)` doesn't silently collapse two unrelated
-/// edits into one.
+/// Dedup key for `edits[]`. `tool_use_id` is the strongest signal, but
+/// capture from older Claude Code builds (or `prov backfill`-style synthesized
+/// edits) may leave it `None`; the fallback discriminator distinguishes
+/// distinct edits that share `(conversation_id, turn_index)`.
+///
+/// Shape mirrors `hook.rs::dedupe_and_sort_edits` so the two dedupers stay in
+/// sync — `tool_use_id` is held in its own slot rather than collapsed into a
+/// generic string, and the fallback uses `(file, line_range)` which is
+/// stable across re-captures and can't collide with a `tool_use_id` value.
+/// Holding `tool_use_id` in a dedicated slot prevents an exotic id containing
+/// the fallback's `@` / `-` separators from masquerading as another edit's
+/// fallback discriminator.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct EditKey {
     conversation_id: String,
     turn_index: u32,
-    discriminator: String,
+    tool_use_id: Option<String>,
+    /// Empty when `tool_use_id` is `Some(_)`; otherwise `"{file}@{start}-{end}"`.
+    fallback: String,
 }
 
 impl EditKey {
     fn from_edit(edit: &Edit) -> Self {
-        let discriminator = edit.tool_use_id.clone().unwrap_or_else(|| {
-            // Fallback: join hashes with `|` (not a hex char, so no aliasing).
-            edit.content_hashes.join("|")
-        });
+        let fallback = if edit.tool_use_id.is_none() {
+            format!(
+                "{}@{}-{}",
+                edit.file, edit.line_range[0], edit.line_range[1]
+            )
+        } else {
+            String::new()
+        };
         Self {
             conversation_id: edit.conversation_id.clone(),
             turn_index: edit.turn_index,
-            discriminator,
+            tool_use_id: edit.tool_use_id.clone(),
+            fallback,
         }
     }
 }
@@ -282,9 +358,21 @@ mod tests {
     use prov_core::schema::{Edit, Note};
 
     fn edit(conv: &str, turn: u32, tool: Option<&str>, ts: &str, hash: &str) -> Edit {
+        edit_at(conv, turn, tool, ts, hash, "x.rs", [1, 1])
+    }
+
+    fn edit_at(
+        conv: &str,
+        turn: u32,
+        tool: Option<&str>,
+        ts: &str,
+        hash: &str,
+        file: &str,
+        line_range: [u32; 2],
+    ) -> Edit {
         Edit {
-            file: "x.rs".into(),
-            line_range: [1, 1],
+            file: file.into(),
+            line_range,
             content_hashes: vec![hash.into()],
             original_blob_sha: None,
             prompt: format!("p-{conv}-{turn}"),
@@ -325,12 +413,36 @@ mod tests {
     }
 
     #[test]
+    fn split_conflict_appends_shared_prefix_to_both_sides() {
+        // git's diff3 textual merge places matching JSON prefix/suffix OUTSIDE
+        // the conflict markers (e.g. the shared `{`, `"version": 1,`, `}`
+        // when notes are pretty-printed). Those lines belong to both sides
+        // and must be threaded into both buffers so the JSON parses cleanly.
+        let body = "{\n  \"version\": 1,\n<<<<<<< refs/notes/prompts\n  \"edits\": [{\"a\":1}]\n=======\n  \"edits\": [{\"b\":2}]\n>>>>>>> refs/notes/origin/prompts\n}\n";
+        let (l, i) = split_conflict(body).expect("markers present");
+        // Both sides should now reconstruct as parseable JSON-ish bodies
+        // carrying the shared envelope around their own conflicting line.
+        assert!(l.contains("\"version\": 1"));
+        assert!(l.contains("[{\"a\":1}]"));
+        assert!(l.trim_end().ends_with('}'));
+        assert!(i.contains("\"version\": 1"));
+        assert!(i.contains("[{\"b\":2}]"));
+        assert!(i.trim_end().ends_with('}'));
+    }
+
+    #[test]
     fn merge_unions_disjoint_edits() {
         let local = Note::new(vec![edit("a", 0, Some("t1"), "2026-01-01T00:00:00Z", "h1")]);
         let incoming = Note::new(vec![edit("b", 5, Some("t2"), "2026-01-02T00:00:00Z", "h2")]);
         let local_json = local.to_json().unwrap();
         let incoming_json = incoming.to_json().unwrap();
-        let merged = merge_note_pair("deadbeef", &local_json, &incoming_json).unwrap();
+        let merged = merge_note_pair(
+            "deadbeef",
+            "refs/notes/prompts",
+            &local_json,
+            &incoming_json,
+        )
+        .unwrap();
         let parsed = Note::from_json(&merged).unwrap();
         assert_eq!(parsed.edits.len(), 2);
         assert_eq!(parsed.edits[0].conversation_id, "a");
@@ -355,6 +467,7 @@ mod tests {
         )]);
         let merged = merge_note_pair(
             "deadbeef",
+            "refs/notes/prompts",
             &local.to_json().unwrap(),
             &incoming.to_json().unwrap(),
         )
@@ -368,13 +481,33 @@ mod tests {
 
     #[test]
     fn merge_falls_back_to_content_hash_when_tool_use_id_is_none() {
-        // Same conversation+turn+None tool_use_id but different content
-        // hashes — these are distinct edits captured by an older client and
-        // should not collapse.
-        let local = Note::new(vec![edit("a", 0, None, "2026-01-01T00:00:00Z", "h1")]);
-        let incoming = Note::new(vec![edit("a", 0, None, "2026-01-02T00:00:00Z", "h2")]);
+        // Same conversation+turn+None tool_use_id but distinct (file,
+        // line_range) pairs — these are distinct edits captured by an older
+        // client and should not collapse. Mirrors the
+        // `(conversation_id, turn_index, tool_use_id, fallback)` shape used
+        // by `hook.rs::dedupe_and_sort_edits`, where the fallback is
+        // `"{file}@{start}-{end}"` when `tool_use_id` is `None`.
+        let local = Note::new(vec![edit_at(
+            "a",
+            0,
+            None,
+            "2026-01-01T00:00:00Z",
+            "h1",
+            "alpha.rs",
+            [1, 1],
+        )]);
+        let incoming = Note::new(vec![edit_at(
+            "a",
+            0,
+            None,
+            "2026-01-02T00:00:00Z",
+            "h2",
+            "beta.rs",
+            [1, 1],
+        )]);
         let merged = merge_note_pair(
             "deadbeef",
+            "refs/notes/prompts",
             &local.to_json().unwrap(),
             &incoming.to_json().unwrap(),
         )
@@ -392,6 +525,7 @@ mod tests {
         let incoming = Note::new(vec![edit("a", 2, Some("t3"), "2026-01-03T00:00:00Z", "h3")]);
         let merged = merge_note_pair(
             "deadbeef",
+            "refs/notes/prompts",
             &local.to_json().unwrap(),
             &incoming.to_json().unwrap(),
         )
@@ -412,11 +546,47 @@ mod tests {
     fn merge_rejects_unknown_schema_version() {
         let bad = r#"{"version":99,"edits":[]}"#;
         let good = Note::new(vec![]).to_json().unwrap();
-        let err = merge_note_pair("deadbeef", bad, &good).unwrap_err();
+        let err = merge_note_pair("deadbeef", "refs/notes/prompts", bad, &good).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("schema version") && msg.contains("v99"),
             "expected schema-version error mentioning v99, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn merge_error_message_uses_target_ref_for_abort_hint() {
+        // The user-facing abort hint should track whichever ref is actually
+        // being merged, not the hardcoded `prompts` default — otherwise a
+        // user resolving a custom notes ref (e.g. `prompts-private`) would be
+        // told to abort the wrong ref.
+        let bad = r#"{"version":99,"edits":[]}"#;
+        let good = Note::new(vec![]).to_json().unwrap();
+        let err =
+            merge_note_pair("deadbeef", "refs/notes/prompts-private", bad, &good).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--ref=refs/notes/prompts-private"),
+            "expected abort hint with the target ref, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_note_with_context_translates_missing_version() {
+        // `MissingVersion` (e.g., truncated note, version field absent) gets
+        // an explicit hint pointing at `git notes show <sha>` so the user
+        // knows how to inspect the malformed payload.
+        let body = r#"{"edits":[]}"#;
+        let err =
+            parse_note_with_context("deadbeef", "refs/notes/prompts", "local", body).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing a 'version' field"),
+            "expected missing-version hint, got: {msg}"
+        );
+        assert!(
+            msg.contains("git notes show deadbeef"),
+            "expected inspection hint, got: {msg}"
         );
     }
 
