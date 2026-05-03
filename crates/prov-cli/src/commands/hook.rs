@@ -217,6 +217,12 @@ struct PostToolUsePayload {
     tool_input: serde_json::Value,
     #[serde(default)]
     tool_response: serde_json::Value,
+    /// Path to the session transcript JSONL. The PostToolUse hook payload
+    /// always carries this; we read the most recent assistant entry from it
+    /// to capture the *current* model rather than the (possibly stale)
+    /// SessionStart model — `/model` does not re-fire SessionStart.
+    #[serde(default)]
+    transcript_path: Option<String>,
 }
 
 fn handle_post_tool_use(staging: &Staging, work_tree: Option<&Path>) -> Result<(), HandlerError> {
@@ -237,6 +243,14 @@ fn handle_post_tool_use(staging: &Staging, work_tree: Option<&Path>) -> Result<(
         .unwrap_or(0)
         .saturating_sub(1);
 
+    // Read the model from the transcript so we capture the model that
+    // produced *this* edit, not whatever was set when SessionStart fired.
+    // `None` is fine — flush_visibility falls back to SessionMeta.model.
+    let model = payload
+        .transcript_path
+        .as_deref()
+        .and_then(read_latest_assistant_model);
+
     let edits = decompose_tool_use(
         &tool_name,
         &payload.tool_input,
@@ -244,6 +258,7 @@ fn handle_post_tool_use(staging: &Staging, work_tree: Option<&Path>) -> Result<(
         &sid,
         turn_index,
         payload.tool_use_id.as_deref(),
+        model.as_deref(),
         work_tree,
     );
 
@@ -314,6 +329,7 @@ fn most_recent_turn_started_at(
 ///
 /// `tool_response.structuredPatch` is not parsed in v1. The empirical-pinning
 /// step is tracked as a follow-up after a live-session capture.
+#[allow(clippy::too_many_arguments)]
 fn decompose_tool_use(
     tool_name: &str,
     tool_input: &serde_json::Value,
@@ -321,6 +337,7 @@ fn decompose_tool_use(
     sid: &SessionId,
     turn_index: u32,
     tool_use_id: Option<&str>,
+    model: Option<&str>,
     work_tree: Option<&Path>,
 ) -> Vec<EditRecord> {
     let timestamp = now_iso8601();
@@ -342,6 +359,7 @@ fn decompose_tool_use(
                 turn_index,
                 tool_name,
                 tool_use_id,
+                model,
                 file,
                 old,
                 new,
@@ -362,6 +380,7 @@ fn decompose_tool_use(
                 turn_index,
                 tool_name,
                 tool_use_id,
+                model,
                 file,
                 "",
                 content,
@@ -386,6 +405,7 @@ fn decompose_tool_use(
                         turn_index,
                         tool_name,
                         tool_use_id,
+                        model,
                         file,
                         old,
                         new,
@@ -405,6 +425,7 @@ fn record_for(
     turn_index: u32,
     tool_name: &str,
     tool_use_id: Option<&str>,
+    model: Option<&str>,
     file: &str,
     before: &str,
     after: &str,
@@ -431,8 +452,63 @@ fn record_for(
         before: before.to_string(),
         after: after.to_string(),
         content_hashes,
+        model: model.map(str::to_string),
         timestamp: timestamp.to_string(),
     }
+}
+
+/// Read `transcript_path` and return the `message.model` field of the most
+/// recent `type:"assistant"` entry. Returns `None` for any failure (missing
+/// file, malformed JSON, no assistant entries, no model field) — callers fall
+/// back to `SessionMeta.model`. A capture failure must never block the agent.
+///
+/// Hard-cap the bytes we read: real transcripts grow into the megabytes, but
+/// we only need the tail. Read the full file and walk lines from the end —
+/// JSONL is line-delimited, so reading bottom-up is the natural order.
+fn read_latest_assistant_model(path: &str) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    /// Cap on transcript bytes scanned. A long-running session can produce
+    /// tens of MB of transcript; reading all of it on every PostToolUse would
+    /// be wasteful when the only data we need is in the last assistant entry
+    /// (typically the final few KB).
+    const MAX_TAIL_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
+
+    let metadata = std::fs::metadata(path).ok()?;
+    let len = metadata.len();
+    let read_from = len.saturating_sub(MAX_TAIL_BYTES);
+
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(read_from)).ok()?;
+    let mut buf = Vec::with_capacity(usize::try_from(len - read_from).unwrap_or(0));
+    file.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+
+    // If we tail-read past a partial first line, drop it — JSONL parses fail
+    // on partial lines anyway, but discarding cleanly keeps the loop tidy.
+    let mut iter = text.lines();
+    if read_from > 0 {
+        iter.next();
+    }
+    let lines: Vec<&str> = iter.collect();
+
+    for line in lines.iter().rev() {
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if obj.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let model = obj
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(|v| v.as_str())?;
+        if model.is_empty() {
+            continue;
+        }
+        return Some(model.to_string());
+    }
+    None
 }
 
 /// Convert Claude Code's absolute `file_path` to a path relative to the work
@@ -645,6 +721,14 @@ fn flush_visibility(
                 .find(|t| t.turn_index == er.turn_index)
                 .map(|t| t.prompt.clone())
                 .unwrap_or_default();
+            // Per-edit model (read from transcript at capture time) wins over
+            // SessionMeta.model. SessionStart only fires once per session, so
+            // a `/model` switch mid-session would otherwise mis-attribute every
+            // later turn. Legacy records (no model field) fall back.
+            let model = er
+                .model
+                .clone()
+                .unwrap_or_else(|| session_meta.model.clone());
             let mut edit = Edit {
                 file: matched.file.clone(),
                 line_range: matched.line_range,
@@ -655,7 +739,7 @@ fn flush_visibility(
                 turn_index: er.turn_index,
                 tool_use_id: er.tool_use_id.clone(),
                 preceding_turns_summary: None,
-                model: session_meta.model.clone(),
+                model,
                 tool: "claude-code".into(),
                 timestamp: er.timestamp.clone(),
                 derived_from: None,
@@ -1441,11 +1525,37 @@ mod tests {
             0,
             Some("toolu_1"),
             None,
+            None,
         );
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].tool_name, "Edit");
         assert_eq!(recs[0].file, "src/lib.rs");
         assert_eq!(recs[0].after, "new");
+    }
+
+    #[test]
+    fn decompose_carries_model_into_record() {
+        // The model captured at PostToolUse time (read from the transcript)
+        // must land on the EditRecord so the post-commit flush uses it
+        // verbatim instead of falling back to SessionMeta.model.
+        let sid = SessionId::parse("sess_t").unwrap();
+        let input = serde_json::json!({
+            "file_path": "src/lib.rs",
+            "old_string": "old",
+            "new_string": "new",
+        });
+        let recs = decompose_tool_use(
+            "Edit",
+            &input,
+            &serde_json::Value::Null,
+            &sid,
+            0,
+            Some("toolu_1"),
+            Some("claude-sonnet-4-6"),
+            None,
+        );
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].model.as_deref(), Some("claude-sonnet-4-6"));
     }
 
     #[test]
@@ -1468,6 +1578,7 @@ mod tests {
             &sid,
             0,
             Some("toolu_1"),
+            None,
             Some(work_tree),
         );
         assert_eq!(recs.len(), 1);
@@ -1491,6 +1602,7 @@ mod tests {
             &serde_json::Value::Null,
             &sid,
             0,
+            None,
             None,
             Some(work_tree),
         );
@@ -1516,11 +1628,17 @@ mod tests {
             &sid,
             0,
             Some("toolu_1"),
+            Some("claude-sonnet-4-6"),
             None,
         );
         assert_eq!(recs.len(), 3);
         assert_eq!(recs[0].after, "1");
         assert_eq!(recs[2].after, "3");
+        // Same model is stamped on every inner-edit record so a per-MultiEdit
+        // model never gets lost halfway through the loop.
+        assert!(recs
+            .iter()
+            .all(|r| r.model.as_deref() == Some("claude-sonnet-4-6")));
     }
 
     #[test]
@@ -1532,6 +1650,7 @@ mod tests {
             &serde_json::Value::Null,
             &sid,
             0,
+            None,
             None,
             None,
         );
@@ -1570,6 +1689,7 @@ mod tests {
             before: String::new(),
             after: "alpha\nbeta\n".into(),
             content_hashes: vec![],
+            model: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
         };
         let m = match_edit_to_diff(&er, &added_by_file, Some(work_tree)).expect("match");
@@ -1640,5 +1760,77 @@ mod tests {
     fn normalize_collapses_whitespace_and_quotes() {
         assert_eq!(normalize("  alpha   beta  "), " alpha beta");
         assert_eq!(normalize("\u{201C}hi\u{201D}"), "\"hi\"");
+    }
+
+    fn write_transcript(lines: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("transcript.jsonl");
+        let mut body = String::new();
+        for l in lines {
+            body.push_str(l);
+            body.push('\n');
+        }
+        std::fs::write(&path, body).expect("write transcript");
+        (dir, path)
+    }
+
+    #[test]
+    fn read_latest_assistant_model_returns_most_recent_model() {
+        // The transcript may contain mixed `user`, `system`, and multiple
+        // `assistant` entries; we want the model from the LAST assistant
+        // entry (the one that just produced the tool call we're staging).
+        let (_dir, path) = write_transcript(&[
+            r#"{"type":"system","subtype":"init"}"#,
+            r#"{"type":"user","message":{}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-7[1m]","content":[]}}"#,
+            r#"{"type":"user","message":{}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-4-6","content":[]}}"#,
+        ]);
+        let model = read_latest_assistant_model(path.to_str().unwrap());
+        assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn read_latest_assistant_model_handles_missing_file() {
+        // Defensive: a hook payload that points at a path that doesn't exist
+        // (or a file we can't read) must return None, not panic — the caller
+        // falls back to SessionMeta.model on None.
+        assert_eq!(read_latest_assistant_model("/no/such/path.jsonl"), None);
+    }
+
+    #[test]
+    fn read_latest_assistant_model_skips_non_assistant_entries() {
+        let (_dir, path) = write_transcript(&[
+            r#"{"type":"user","message":{"model":"not-this-one"}}"#,
+            r#"{"type":"system","subtype":"compact"}"#,
+        ]);
+        assert_eq!(read_latest_assistant_model(path.to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn read_latest_assistant_model_skips_malformed_lines() {
+        // A truncated trailing line (or any non-JSON garbage) must not abort
+        // the scan; we walk past it to the most recent valid assistant entry.
+        let (_dir, path) = write_transcript(&[
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-4-6"}}"#,
+            "not valid json",
+        ]);
+        assert_eq!(
+            read_latest_assistant_model(path.to_str().unwrap()).as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+    }
+
+    #[test]
+    fn read_latest_assistant_model_treats_empty_string_as_missing() {
+        let (_dir, path) = write_transcript(&[
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-4-6"}}"#,
+            r#"{"type":"assistant","message":{"model":""}}"#,
+        ]);
+        // Skip the empty-model entry and fall back to the prior valid one.
+        assert_eq!(
+            read_latest_assistant_model(path.to_str().unwrap()).as_deref(),
+            Some("claude-sonnet-4-6")
+        );
     }
 }
