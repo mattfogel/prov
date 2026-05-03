@@ -1,0 +1,481 @@
+# Prov Dogfooding & End-to-End Testing Guide
+
+A by-hand walkthrough of every shipped feature, with edge cases the test
+suite has caught regressions on at least once. Use this when validating a
+release candidate, after a refactor that touches a hot path, or when you
+just want to feel the surface from a user's seat.
+
+Stubs (`prov regenerate`, `prov backfill`) are listed at the end so you
+can confirm they still fail loudly rather than silently no-op.
+
+## 0. Prerequisites
+
+```bash
+# 1. From the prov repo, build a release binary and put it on PATH for the
+#    sandbox shell. Do NOT install globally — tests should run against the
+#    binary you just built.
+cd /Users/matt/Documents/GitHub/prov
+cargo build --release
+export PATH="$PWD/target/release:$PATH"
+prov --version       # confirms the right binary is on PATH
+
+# 2. CI parity check before you start (optional but recommended after rebases).
+./scripts/check.sh
+```
+
+Create a fresh sandbox repo so nothing pollutes your real working trees:
+
+```bash
+SANDBOX="$(mktemp -d /tmp/prov-dogfood-XXXX)"
+cd "$SANDBOX"
+git init -q
+git commit --allow-empty -m "root"
+echo "$SANDBOX"     # remember this path; cleanup at the end
+```
+
+For sync tests you also want a bare "remote" peer:
+
+```bash
+PEER="$(mktemp -d /tmp/prov-peer-XXXX)"
+git init --bare -q "$PEER"
+git -C "$SANDBOX" remote add origin "$PEER"
+```
+
+## 1. Install / uninstall
+
+### Golden path
+
+```bash
+cd "$SANDBOX"
+prov install
+ls .git/hooks/                    # post-commit, pre-push, post-rewrite present
+cat .claude/settings.json         # 4 prov hook entries (SessionStart, UserPromptSubmit, PostToolUse, Stop)
+git config --get notes.displayRef         # refs/notes/prompts
+git config --get notes.mergeStrategy      # manual
+git config --get notes.rewrite.amend      # false
+test -f .git/prov.db && echo "cache OK"
+```
+
+### Edge cases
+
+```bash
+# Idempotent re-install: same on-disk state, no duplicate hook blocks.
+prov install
+grep -c '# >>> prov' .git/hooks/post-commit          # exactly 1
+grep -c '"command": "prov hook' .claude/settings.json # exactly 4
+
+# Pre-existing user content in a hook: prov block is added/refreshed in place.
+echo 'echo user-hook' >> .git/hooks/post-commit
+prov install
+grep -A1 '# <<< prov' .git/hooks/post-commit         # user content survives
+
+# Team-mode opt-in (writes a fetch refspec, arms the pre-push gate).
+prov install --enable-push origin
+git config --get-all remote.origin.fetch             # includes refs/notes/prompts:refs/notes/origin/prompts
+
+# Uninstall removes prov-managed lines but leaves your data.
+prov uninstall
+grep -c '# >>> prov' .git/hooks/post-commit          # 0
+test -f .git/prov.db && echo "cache preserved (expected)"
+git for-each-ref refs/notes/                          # notes ref untouched
+
+# --purge also drops cache and staging.
+prov install
+prov uninstall --purge
+test -f .git/prov.db || echo "cache gone"
+test -d .git/prov-staging || echo "staging gone"
+
+# Uninstall is idempotent.
+prov uninstall --purge
+prov uninstall --purge   # no error
+```
+
+Reinstall before continuing:
+
+```bash
+prov install --enable-push origin
+```
+
+## 2. Capture (Claude Code session → staging → note on commit)
+
+The `post-commit` hook flushes whatever is staged in `.git/prov-staging/`
+into a note attached to HEAD. To exercise capture without running a real
+Claude Code session, simulate the hook payloads directly:
+
+```bash
+SID="dogfood-$(date +%s)"
+
+# Simulate a SessionStart.
+echo "{\"session_id\":\"$SID\",\"model\":\"claude-sonnet-4-5\"}" \
+  | prov hook session-start
+
+# Simulate a UserPromptSubmit (public).
+echo "{\"session_id\":\"$SID\",\"prompt\":\"add a hello function\",\"cwd\":\"$SANDBOX\",\"transcript_path\":\"\"}" \
+  | prov hook user-prompt-submit
+
+# Simulate the agent's edit landing on disk.
+mkdir -p src && cat > src/hello.ts <<'EOF'
+export function hello(name: string) {
+  return `hello, ${name}`;
+}
+EOF
+
+# Simulate the PostToolUse for that edit (ranges are 1-indexed inclusive).
+echo "{\"session_id\":\"$SID\",\"tool_input\":{\"file_path\":\"src/hello.ts\",\"writes\":[{\"line_start\":1,\"line_end\":3}]}}" \
+  | prov hook post-tool-use
+
+# Simulate the turn ending.
+echo "{\"session_id\":\"$SID\"}" | prov hook stop
+
+# Commit — post-commit will fire and write a note on HEAD.
+git add src/hello.ts
+git commit -q -m "feat: hello"
+git notes --ref=refs/notes/prompts list | head    # should list HEAD's note
+```
+
+### Edge cases
+
+```bash
+# Private routing — # prov:private on the first line lands the prompt and
+# its edits in .git/prov-staging/<sid>/private/, not the public dir.
+SID="priv-$(date +%s)"
+echo "{\"session_id\":\"$SID\",\"model\":\"claude-sonnet-4-5\"}" | prov hook session-start
+echo "{\"session_id\":\"$SID\",\"prompt\":\"# prov:private\nrotate the staging credentials\",\"cwd\":\"$SANDBOX\",\"transcript_path\":\"\"}" \
+  | prov hook user-prompt-submit
+ls .git/prov-staging/$SID/private/    # turn-1.json present here, NOT in the public dir
+ls .git/prov-staging/$SID/ | grep -v private || true
+
+# Redaction — secrets in the prompt become [REDACTED:...] markers before staging.
+SID="redact-$(date +%s)"
+echo "{\"session_id\":\"$SID\",\"model\":\"x\"}" | prov hook session-start
+echo "{\"session_id\":\"$SID\",\"prompt\":\"key=AKIAIOSFODNN7EXAMPLE and pat=ghp_1234567890abcdefghijABCDEFGHIJABCD\",\"cwd\":\"$SANDBOX\",\"transcript_path\":\"\"}" \
+  | prov hook user-prompt-submit
+grep REDACTED .git/prov-staging/$SID/turn-*.json     # AWS key and GitHub PAT both replaced
+
+# .provignore — repo-local regex rules add custom redactors.
+echo 'AcmeCorp-[A-Z0-9]{8}' > .provignore
+SID="provign-$(date +%s)"
+echo "{\"session_id\":\"$SID\",\"model\":\"x\"}" | prov hook session-start
+echo "{\"session_id\":\"$SID\",\"prompt\":\"customer=AcmeCorp-AB12CD34\",\"cwd\":\"$SANDBOX\",\"transcript_path\":\"\"}" \
+  | prov hook user-prompt-submit
+grep 'REDACTED:provignore-rule' .git/prov-staging/$SID/turn-*.json
+rm .provignore
+```
+
+## 3. Read surface
+
+```bash
+# Whole-file lookup: every recorded edit, ordered by recency.
+prov log src/hello.ts
+prov log src/hello.ts --json | jq .
+
+# Point lookup: the prompt that produced one specific line.
+prov log src/hello.ts:2
+
+# History walk: show superseded prompts via derived_from.
+prov log src/hello.ts:2 --history
+
+# --only-if-substantial skips files <10 lines or with no notes (used by the Skill).
+prov log src/hello.ts --only-if-substantial          # empty (3 lines)
+seq 20 | tee src/big.ts >/dev/null && git add src/big.ts && git commit -qm "big"
+prov log src/big.ts --only-if-substantial            # empty (no notes)
+
+# Search — FTS5 over prompts.
+prov search "hello"
+prov search "hello" --json | jq '.results | length'
+prov search --limit 1 "hello"
+
+# Operator escaping: pure literal phrase, no syntax errors from FTS5.
+prov search '"quoted-phrase"'
+prov search '-foo'
+```
+
+### PR timeline
+
+```bash
+git checkout -q -b feature
+# Make a captured edit on the branch (reuse the SID-driven recipe above).
+prov pr-timeline --base main --head HEAD --markdown
+prov pr-timeline --base main --head HEAD --json | jq .
+git checkout -q main
+```
+
+Edge case worth eyeballing: a PR with >5,000 added lines should mark the
+overflow under "no provenance" rather than truncating silently.
+
+## 4. Cache / reindex
+
+```bash
+prov reindex
+prov reindex --json | jq .schema_version
+
+# Drift recovery: write a note via raw git, confirm the cache notices.
+git notes --ref=refs/notes/prompts add -f -m '{"schema_version":1,"edits":[]}' HEAD
+prov log src/hello.ts                                # forces freshness check; rebuilds if stamp drifts
+```
+
+## 5. Privacy
+
+### `prov mark-private`
+
+```bash
+SHA=$(git rev-parse HEAD)
+prov mark-private "$SHA"
+git notes --ref=refs/notes/prompts list | grep "$SHA" || echo "removed from public"
+git notes --ref=refs/notes/prompts-private list | grep "$SHA" && echo "now private"
+
+# Idempotent on already-private (no-op message, exit 0).
+prov mark-private "$SHA"
+
+# No-note commit (clear message, exit 0).
+ROOT=$(git rev-list --max-parents=0 HEAD)
+prov mark-private "$ROOT"
+
+# Bad ref — git's error surfaces.
+prov mark-private deadbeef || echo "expected failure"
+```
+
+### `prov redact-history`
+
+```bash
+# Set up a note containing a secret-looking string, then scrub it.
+SID="leak-$(date +%s)"
+echo "{\"session_id\":\"$SID\",\"model\":\"x\"}" | prov hook session-start
+echo "{\"session_id\":\"$SID\",\"prompt\":\"the token is sk_live_supersecret\",\"cwd\":\"$SANDBOX\",\"transcript_path\":\"\"}" \
+  | prov hook user-prompt-submit
+echo "{\"session_id\":\"$SID\"}" | prov hook stop
+echo leak >> src/hello.ts && git add . && git commit -qm "leak"
+prov redact-history 'sk_live_[A-Za-z0-9]+'
+git notes --ref=refs/notes/prompts show HEAD | grep -c REDACTED   # >=1
+
+# Invalid regex must error before any rewrite.
+prov redact-history 'invalid[regex' || echo "expected fail"
+
+# Pattern that matches nothing — reports 0, exits 0.
+prov redact-history 'will-not-appear-anywhere'
+```
+
+## 6. Sync (fetch / push / pre-push gate / notes-resolve)
+
+### Push and the pre-push gate
+
+```bash
+git push -q origin main
+prov push origin
+# Bare remote now carries refs/notes/prompts.
+git --git-dir="$PEER" for-each-ref refs/notes/
+
+# Pre-push gate: a secret hidden in a note should block the push.
+SID="badpush-$(date +%s)"
+echo "{\"session_id\":\"$SID\",\"model\":\"x\"}" | prov hook session-start
+# Bypass the write-time redactor by editing the note in place after capture.
+echo "{\"session_id\":\"$SID\",\"prompt\":\"safe\",\"cwd\":\"$SANDBOX\",\"transcript_path\":\"\"}" \
+  | prov hook user-prompt-submit
+echo "{\"session_id\":\"$SID\"}" | prov hook stop
+echo gate >> src/hello.ts && git add . && git commit -qm "gate"
+git notes --ref=refs/notes/prompts append -m 'leaked: AKIAIOSFODNN7EXAMPLE' HEAD
+prov push origin || echo "expected: gate blocked the push"
+
+# Documented escape hatch — bypass + audit trail in staging.
+prov push origin --no-verify
+ls .git/prov-staging/log 2>/dev/null && echo "override logged"
+
+# Clean up the seeded leak.
+prov redact-history 'AKIA[A-Z0-9]+'
+prov push origin
+```
+
+### Fetch and conflict resolution
+
+Simulate a divergent peer to drive `prov notes-resolve` end-to-end:
+
+```bash
+CLONE="$(mktemp -d /tmp/prov-clone-XXXX)"
+git clone -q "$PEER" "$CLONE"
+(
+  cd "$CLONE"
+  prov install --enable-push origin
+  prov fetch origin
+  # Cause the clone to diverge: add an edit-bearing note on the same commit.
+  HEAD_SHA=$(git rev-parse HEAD)
+  git notes --ref=refs/notes/prompts add -f \
+    -m '{"schema_version":1,"edits":[{"file":"src/hello.ts","line_range":[1,3],"prompt":"clone side"}]}' \
+    "$HEAD_SHA"
+  prov push origin
+)
+
+# Back in the sandbox: write a different note on the same commit, fetch, resolve.
+HEAD_SHA=$(git rev-parse HEAD)
+git notes --ref=refs/notes/prompts add -f \
+  -m '{"schema_version":1,"edits":[{"file":"src/hello.ts","line_range":[1,3],"prompt":"sandbox side"}]}' \
+  "$HEAD_SHA"
+prov fetch origin || echo "merge in progress (expected)"
+ls .git/NOTES_MERGE_WORKTREE/                   # one file per conflicted commit
+prov notes-resolve
+git notes --ref=refs/notes/prompts show "$HEAD_SHA" | jq '.edits | length'   # union >= 2
+prov push origin
+```
+
+Edge cases the resolver must handle (existing tests cover these — verify
+they're green before relying on the binary):
+
+- Diff3 shared-context lines (JSON braces, `version` field) appear
+  **outside** the conflict markers and must be appended to **both** sides
+  to reconstruct valid JSON. See
+  `docs/solutions/conventions/git-notes-merge-conflict-parsing-conventions-2026-05-03.md`.
+- Entries with `tool_use_id: None` must dedupe by `(file, line_range)`,
+  not collapse onto each other. Regression test:
+  `squash_with_none_tool_use_id_keeps_distinct_file_regions`.
+- Schema version mismatch on one side aborts that file only; re-running
+  recovers.
+
+## 7. Rewrite preservation (amend / rebase / squash / repair)
+
+### Amend
+
+```bash
+prov log -- src/hello.ts >/dev/null     # warm path
+HEAD_BEFORE=$(git rev-parse HEAD)
+echo "// tweak" >> src/hello.ts
+git commit -q --amend --no-edit
+HEAD_AFTER=$(git rev-parse HEAD)
+git notes --ref=refs/notes/prompts list | grep "$HEAD_AFTER" && echo "note migrated"
+git notes --ref=refs/notes/prompts list | grep "$HEAD_BEFORE" || echo "old SHA cleaned up"
+```
+
+### Rebase + squash (N:1 edits[] union)
+
+```bash
+git checkout -q -b r1
+for i in 1 2 3; do echo "line $i" >> src/big.ts; git commit -qam "step $i"; done
+GIT_SEQUENCE_EDITOR='sed -i.bak -e "2,\$ s/^pick/squash/"' git rebase -i HEAD~3
+NEW=$(git rev-parse HEAD)
+git notes --ref=refs/notes/prompts show "$NEW" | jq '.edits | length'   # >= sum of pre-squash edits
+git checkout -q main
+git branch -D r1
+```
+
+### Repair (when the hook was bypassed)
+
+```bash
+# Force orphaning by rewriting via a path that bypasses prov: capture, then
+# blow away the note before the post-rewrite hook fires.
+echo orphan >> src/hello.ts && git commit -qam "orphan"
+ORPHAN_OLD=$(git rev-parse HEAD)
+git -c core.hooksPath=/dev/null commit -q --amend --no-edit   # post-rewrite skipped
+ORPHAN_NEW=$(git rev-parse HEAD)
+git notes --ref=refs/notes/prompts list | grep "$ORPHAN_NEW" || echo "orphaned (expected)"
+
+prov repair --dry-run
+prov repair
+git notes --ref=refs/notes/prompts list | grep "$ORPHAN_NEW" && echo "repaired"
+
+# Re-running is idempotent (new SHA already has a note → skipped).
+prov repair --json | jq '.results[] | select(.status == "skipped-existing")' | head -1
+```
+
+The repair walker matches **only terminal** rewrite events (`commit
+(amend)`, `rebase (finish)`) — `rebase (pick)` and friends produce
+intermediate SHAs and would migrate notes onto throwaway commits if
+they were honored. Regression test: `rewrite_subjects_classified`.
+
+## 8. Housekeeping (`prov gc`)
+
+```bash
+prov gc --dry-run --json | jq .
+
+# Force an unreachable commit and confirm gc culls its note.
+git checkout -q --detach
+echo dead > src/dead.ts && git add . && git commit -qm "dead"
+DEAD=$(git rev-parse HEAD)
+SID="dead-$(date +%s)"
+echo "{\"session_id\":\"$SID\",\"model\":\"x\"}" | prov hook session-start
+echo "{\"session_id\":\"$SID\",\"prompt\":\"dead\",\"cwd\":\"$SANDBOX\",\"transcript_path\":\"\"}" | prov hook user-prompt-submit
+echo "{\"session_id\":\"$SID\"}" | prov hook stop
+git notes --ref=refs/notes/prompts add -f -m '{"schema_version":1,"edits":[]}' "$DEAD"
+git checkout -q main                              # $DEAD now unreachable
+prov gc
+git notes --ref=refs/notes/prompts list | grep "$DEAD" || echo "culled"
+
+# But: detached-HEAD WIP must NOT be culled. Regression test:
+# gc_preserves_notes_for_detached_head_commits.
+git checkout -q --detach
+echo wip > src/wip.ts && git add . && git commit -qm "wip"
+WIP=$(git rev-parse HEAD)
+git notes --ref=refs/notes/prompts add -f -m '{"schema_version":1,"edits":[]}' "$WIP"
+prov gc
+git notes --ref=refs/notes/prompts list | grep "$WIP" && echo "wip preserved"
+git checkout -q main
+
+# Staging TTL: stale dirs prune; unreadable mtime should still prune (defensive
+# polarity — see docs/solutions/.../defensive-default-polarity-conventions...).
+mkdir -p .git/prov-staging/old-session
+touch -t 200001010000 .git/prov-staging/old-session
+prov gc --staging-ttl-days 1
+ls .git/prov-staging/old-session 2>/dev/null || echo "pruned"
+
+# --compact drops preceding_turns_summary on notes >90 days old (need real-aged
+# notes to verify; on a fresh sandbox this is a no-op).
+prov gc --compact --dry-run
+```
+
+## 9. Stubs (should fail loudly, not no-op)
+
+```bash
+prov regenerate src/hello.ts:2 || echo "stub fail (expected)"
+prov backfill --yes              || echo "stub fail (expected)"
+```
+
+If either of these silently succeeds, that's a regression — they're
+documented as not-yet-implemented and must surface that to the user.
+
+## 10. Defensive-default regressions to verify
+
+These five are the explicit polarity invariants from
+`docs/solutions/conventions/defensive-default-polarity-conventions-2026-05-03.md`.
+Bake them into your manual pass; each has a unit test you can re-run as a
+sanity check:
+
+1. `prune_staging` falls back to UNIX_EPOCH on read error (gets pruned),
+   never `now()`. Test above under section 8.
+2. Cache `notes_ref_sha` stamp survives transient `git rev-parse` errors —
+   "error reading ref" is not the same as "ref absent."
+3. `dedupe_and_sort_edits` includes `(file, line_range)` in the key when
+   `tool_use_id` is `None`. Verified by section 6.
+4. `is_reachable` augments `for-each-ref` with `merge-base --is-ancestor`
+   so detached HEAD WIP is preserved. Verified by section 8.
+5. `is_rewrite_subject` matches only terminal reflog events. Verified by
+   section 7.
+
+Run the targeted unit tests for cheap reassurance:
+
+```bash
+cd /Users/matt/Documents/GitHub/prov
+cargo test --release \
+  squash_with_none_tool_use_id_keeps_distinct_file_regions \
+  gc_preserves_notes_for_detached_head_commits \
+  rewrite_subjects_classified \
+  split_conflict_appends_shared_prefix_to_both_sides
+```
+
+## 11. Cleanup
+
+```bash
+rm -rf "$SANDBOX" "$PEER" "$CLONE"
+unset SANDBOX PEER CLONE SID SHA HEAD_BEFORE HEAD_AFTER ORPHAN_OLD ORPHAN_NEW DEAD WIP NEW ROOT HEAD_SHA
+```
+
+## Appendix: troubleshooting
+
+- **Hook didn't fire.** Confirm `core.hooksPath` is unset (or includes
+  `.git/hooks`). Inspect `.git/hooks/post-commit` for the `# >>> prov`
+  block.
+- **Note not visible after commit.** Run `prov reindex`. The post-commit
+  cache write is best-effort; a stale cache reads as "no provenance."
+- **`prov fetch` says "merge in progress."** Resolve with
+  `prov notes-resolve`; if a partial rewrite left files behind, re-run
+  the resolver — it revalidates and finalizes idempotently.
+- **`prov push` blocked unexpectedly.** Inspect the offending note with
+  `git notes --ref=refs/notes/prompts show <sha>`. Use
+  `prov redact-history '<pattern>'` to scrub, then push without
+  `--no-verify`. Reach for `--no-verify` only after rotating the secret.
