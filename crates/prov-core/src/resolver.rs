@@ -73,12 +73,12 @@ impl Resolver {
             ));
         };
 
-        let Some((edit, line_idx)) = find_edit(&note, &blame.original_file, blame.original_line)
-        else {
+        let candidates = candidate_edits(&note, &blame.original_file, blame.original_line);
+        if candidates.is_empty() {
             return Ok(ResolveResult::no_provenance(
                 NoProvenanceReason::NoMatchingNote,
             ));
-        };
+        }
 
         let current = match read_current_line(&self.git, file, line) {
             Ok(c) => c,
@@ -92,10 +92,19 @@ impl Resolver {
             }
             Err(e) => return Err(e),
         };
-
-        let stored_hash = edit.content_hashes.get(line_idx).map(String::as_str);
         let current_hash = blake3_hex(current.as_bytes());
 
+        // Pick the best candidate. With a single overlap the choice is
+        // trivial, but the post-commit matcher's strategy-c proximity
+        // fallback can collapse multiple captured edits onto the same range
+        // (e.g., three sequential turns that landed in one new file). When
+        // that happens the *first* edit isn't necessarily the one that
+        // currently sits on this line — prefer one whose stored hash
+        // matches, otherwise fall back to the most recent capture.
+        let best = pick_best_candidate(&candidates, &current_hash);
+        let (edit, line_idx) = best;
+
+        let stored_hash = edit.content_hashes.get(line_idx).map(String::as_str);
         let drifted = match stored_hash {
             Some(stored) => stored != current_hash,
             None => true,
@@ -325,19 +334,53 @@ fn parse_blame_porcelain(raw: &str) -> Option<BlameLine> {
     })
 }
 
-fn find_edit<'a>(note: &'a Note, file: &Path, line: u32) -> Option<(&'a Edit, usize)> {
+/// All edits in `note` whose `(file, line_range)` covers `(file, line)`,
+/// paired with the per-edit line offset. Returned in note-order so the caller
+/// can reason about original capture sequence. The post-commit matcher's
+/// proximity fallback can yield several edits with identical line ranges
+/// when a sequence of turns lands in one new file; this surfaces all of them
+/// so the resolver can pick the best match.
+fn candidate_edits<'a>(note: &'a Note, file: &Path, line: u32) -> Vec<(&'a Edit, usize)> {
     let file_str = file.to_string_lossy();
-    note.edits.iter().find_map(|edit| {
-        if edit.file != file_str {
-            return None;
-        }
-        let [start, end] = edit.line_range;
-        if line < start || line > end {
-            return None;
-        }
-        let line_idx = (line - start) as usize;
-        Some((edit, line_idx))
-    })
+    note.edits
+        .iter()
+        .filter_map(|edit| {
+            if edit.file != file_str {
+                return None;
+            }
+            let [start, end] = edit.line_range;
+            if line < start || line > end {
+                return None;
+            }
+            let line_idx = (line - start) as usize;
+            Some((edit, line_idx))
+        })
+        .collect()
+}
+
+/// Pick the candidate that best explains the line that currently sits on
+/// disk. Strategy: prefer any edit whose stored hash matches `current_hash`
+/// (resolves to `Unchanged`); among ties, the most recent capture wins. If no
+/// candidate matches, return the most recent capture so the `Drifted` answer
+/// names the latest write rather than an earlier turn that's been overwritten.
+///
+/// Caller must guarantee `candidates` is non-empty.
+fn pick_best_candidate<'a>(
+    candidates: &[(&'a Edit, usize)],
+    current_hash: &str,
+) -> (&'a Edit, usize) {
+    let matching = candidates.iter().filter(|(edit, idx)| {
+        edit.content_hashes
+            .get(*idx)
+            .is_some_and(|h| h == current_hash)
+    });
+    if let Some(best) = matching.max_by(|(a, _), (b, _)| a.timestamp.cmp(&b.timestamp)) {
+        return *best;
+    }
+    *candidates
+        .iter()
+        .max_by(|(a, _), (b, _)| a.timestamp.cmp(&b.timestamp))
+        .expect("caller guarantees candidates is non-empty")
 }
 
 fn read_current_line(git: &Git, file: &Path, line: u32) -> Result<String, ResolverError> {
@@ -398,31 +441,188 @@ mod tests {
         assert_eq!(parsed.original_file, PathBuf::from("src/lib.rs"));
     }
 
+    fn edit(
+        file: &str,
+        start: u32,
+        end: u32,
+        hashes: Vec<&str>,
+        prompt: &str,
+        timestamp: &str,
+    ) -> Edit {
+        Edit {
+            file: file.into(),
+            line_range: [start, end],
+            content_hashes: hashes.into_iter().map(String::from).collect(),
+            original_blob_sha: None,
+            prompt: prompt.into(),
+            conversation_id: "sess_test".into(),
+            turn_index: 0,
+            tool_use_id: None,
+            preceding_turns_summary: None,
+            model: "claude-sonnet-4-5".into(),
+            tool: "claude-code".into(),
+            timestamp: timestamp.into(),
+            derived_from: None,
+        }
+    }
+
     #[test]
-    fn find_edit_matches_inside_range() {
+    fn candidate_edits_matches_inside_range() {
         let note = fixture_note(
             "src/lib.rs",
             10,
             vec!["h1".into(), "h2".into(), "h3".into()],
         );
-        let (edit, idx) = find_edit(&note, Path::new("src/lib.rs"), 11).unwrap();
+        let cands = candidate_edits(&note, Path::new("src/lib.rs"), 11);
+        assert_eq!(cands.len(), 1);
+        let (edit, idx) = cands[0];
         assert_eq!(idx, 1);
         assert_eq!(edit.line_range, [10, 12]);
     }
 
     #[test]
-    fn find_edit_handles_inclusive_range_boundaries() {
+    fn candidate_edits_handles_inclusive_range_boundaries() {
         let note = fixture_note("src/lib.rs", 5, vec!["a".into(), "b".into()]);
-        assert!(find_edit(&note, Path::new("src/lib.rs"), 5).is_some());
-        assert!(find_edit(&note, Path::new("src/lib.rs"), 6).is_some());
-        assert!(find_edit(&note, Path::new("src/lib.rs"), 4).is_none());
-        assert!(find_edit(&note, Path::new("src/lib.rs"), 7).is_none());
+        assert_eq!(candidate_edits(&note, Path::new("src/lib.rs"), 5).len(), 1);
+        assert_eq!(candidate_edits(&note, Path::new("src/lib.rs"), 6).len(), 1);
+        assert!(candidate_edits(&note, Path::new("src/lib.rs"), 4).is_empty());
+        assert!(candidate_edits(&note, Path::new("src/lib.rs"), 7).is_empty());
     }
 
     #[test]
-    fn find_edit_rejects_wrong_file() {
+    fn candidate_edits_rejects_wrong_file() {
         let note = fixture_note("src/lib.rs", 1, vec!["h".into()]);
-        assert!(find_edit(&note, Path::new("src/other.rs"), 1).is_none());
+        assert!(candidate_edits(&note, Path::new("src/other.rs"), 1).is_empty());
+    }
+
+    #[test]
+    fn candidate_edits_returns_all_overlapping_in_note_order() {
+        // Issue #37 reproduction: three turns whose `after` content didn't
+        // line up with the final diff fall through to the matcher's
+        // proximity strategy and all collapse to the same line range. The
+        // resolver must see all three so it can pick the best one.
+        let note = Note::new(vec![
+            edit(
+                "src/greet.ts",
+                1,
+                6,
+                vec!["a"; 6],
+                "turn1",
+                "2026-05-03T00:01:00Z",
+            ),
+            edit(
+                "src/greet.ts",
+                1,
+                6,
+                vec!["b"; 6],
+                "turn2",
+                "2026-05-03T00:02:00Z",
+            ),
+            edit(
+                "src/greet.ts",
+                1,
+                6,
+                vec!["c"; 6],
+                "turn3",
+                "2026-05-03T00:03:00Z",
+            ),
+        ]);
+        let cands = candidate_edits(&note, Path::new("src/greet.ts"), 1);
+        assert_eq!(cands.len(), 3);
+        let prompts: Vec<&str> = cands.iter().map(|(e, _)| e.prompt.as_str()).collect();
+        assert_eq!(prompts, ["turn1", "turn2", "turn3"]);
+    }
+
+    #[test]
+    fn pick_best_candidate_prefers_matching_hash_over_recency() {
+        // The current line on disk matches turn1's hash (an earlier capture);
+        // even though turn3 is more recent, turn1 should win because it
+        // explains what's actually there.
+        let note = Note::new(vec![
+            edit(
+                "src/greet.ts",
+                1,
+                1,
+                vec!["matching"],
+                "turn1",
+                "2026-05-03T00:01:00Z",
+            ),
+            edit(
+                "src/greet.ts",
+                1,
+                1,
+                vec!["other"],
+                "turn3",
+                "2026-05-03T00:03:00Z",
+            ),
+        ]);
+        let cands = candidate_edits(&note, Path::new("src/greet.ts"), 1);
+        let (edit, _) = pick_best_candidate(&cands, "matching");
+        assert_eq!(edit.prompt, "turn1");
+    }
+
+    #[test]
+    fn pick_best_candidate_breaks_match_ties_by_most_recent() {
+        // Two candidates both match the current hash — the most recent
+        // capture wins so the user sees the latest reaffirmation of the
+        // line, not an earlier identical write.
+        let note = Note::new(vec![
+            edit(
+                "src/greet.ts",
+                1,
+                1,
+                vec!["same"],
+                "turn1",
+                "2026-05-03T00:01:00Z",
+            ),
+            edit(
+                "src/greet.ts",
+                1,
+                1,
+                vec!["same"],
+                "turn3",
+                "2026-05-03T00:03:00Z",
+            ),
+        ]);
+        let cands = candidate_edits(&note, Path::new("src/greet.ts"), 1);
+        let (edit, _) = pick_best_candidate(&cands, "same");
+        assert_eq!(edit.prompt, "turn3");
+    }
+
+    #[test]
+    fn pick_best_candidate_falls_back_to_most_recent_when_nothing_matches() {
+        // Drift case: no candidate's stored hash matches the current line.
+        // The resolver should report Drifted with the most recent capture
+        // (which is the closest thing to "what should be there").
+        let note = Note::new(vec![
+            edit(
+                "src/greet.ts",
+                1,
+                1,
+                vec!["old"],
+                "turn1",
+                "2026-05-03T00:01:00Z",
+            ),
+            edit(
+                "src/greet.ts",
+                1,
+                1,
+                vec!["middle"],
+                "turn2",
+                "2026-05-03T00:02:00Z",
+            ),
+            edit(
+                "src/greet.ts",
+                1,
+                1,
+                vec!["recent"],
+                "turn3",
+                "2026-05-03T00:03:00Z",
+            ),
+        ]);
+        let cands = candidate_edits(&note, Path::new("src/greet.ts"), 1);
+        let (edit, _) = pick_best_candidate(&cands, "drifted-content");
+        assert_eq!(edit.prompt, "turn3");
     }
 
     #[test]

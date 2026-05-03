@@ -247,6 +247,86 @@ fn corrupt_note_at_ref_returns_no_provenance() {
 }
 
 #[test]
+fn overlapping_edits_resolve_to_the_one_that_explains_the_current_line() {
+    // Regression for issue #37. The post-commit matcher's strategy-c
+    // proximity fallback can collapse multiple captured edits onto the same
+    // line range — typical when a sequence of turns lands in one new file
+    // and individual `after` strings can no longer be located in the final
+    // diff. The resolver used to return the first such edit unconditionally,
+    // which mis-attributed the line and reported DRIFTED even though the
+    // user had only ever AI-edited it.
+    let fix = init_with_file("src/greet.ts", "import { template } from './templates';\n");
+
+    // Three edits, all overlapping line 1, captured in turn order. Only the
+    // most recent one's stored hash matches what's actually on disk —
+    // exactly the shape produced by the buggy matcher.
+    let mut t1 = edit_for(
+        "src/greet.ts",
+        1,
+        &["export function greet(name: string) {"],
+    );
+    t1.prompt = "Create src/greet.ts".into();
+    t1.timestamp = "2026-05-03T18:55:15Z".into();
+    let mut t2 = edit_for(
+        "src/greet.ts",
+        1,
+        &["  if (!name) throw new TypeError('name required');"],
+    );
+    t2.prompt = "Tighten the error path".into();
+    t2.timestamp = "2026-05-03T18:55:30Z".into();
+    let mut t3 = edit_for(
+        "src/greet.ts",
+        1,
+        &["import { template } from './templates';"],
+    );
+    t3.prompt = "Extract the greeting template".into();
+    t3.timestamp = "2026-05-03T18:55:46Z".into();
+    fix.notes
+        .write(&fix.head, &Note::new(vec![t1, t2, t3]))
+        .unwrap();
+
+    let r = build_resolver(&fix);
+    let result = r.resolve(Path::new("src/greet.ts"), 1).unwrap();
+    match result {
+        ResolveResult::Unchanged { prompt, .. } => {
+            assert_eq!(
+                prompt, "Extract the greeting template",
+                "should attribute the line to the turn whose hash matches the current content"
+            );
+        }
+        other => panic!("expected Unchanged for AI-written line, got {other:?}"),
+    }
+}
+
+#[test]
+fn overlapping_edits_with_no_match_report_drifted_with_most_recent_capture() {
+    // When none of the overlapping edits' stored hashes match the current
+    // line, the line truly has drifted. The Drifted answer must name the
+    // most recent capture — that's the closest thing to "what should be
+    // there" — not an earlier turn that's been doubly-overwritten.
+    let fix = init_with_file("src/greet.ts", "// hand-edited\n");
+
+    let mut t1 = edit_for("src/greet.ts", 1, &["original-line"]);
+    t1.prompt = "first turn".into();
+    t1.timestamp = "2026-05-03T00:00:01Z".into();
+    let mut t2 = edit_for("src/greet.ts", 1, &["second-line"]);
+    t2.prompt = "most recent turn".into();
+    t2.timestamp = "2026-05-03T00:00:02Z".into();
+    fix.notes
+        .write(&fix.head, &Note::new(vec![t1, t2]))
+        .unwrap();
+
+    let r = build_resolver(&fix);
+    let result = r.resolve(Path::new("src/greet.ts"), 1).unwrap();
+    match result {
+        ResolveResult::Drifted { prompt, .. } => {
+            assert_eq!(prompt, "most recent turn");
+        }
+        other => panic!("expected Drifted, got {other:?}"),
+    }
+}
+
+#[test]
 fn no_blame_when_line_out_of_range() {
     let fix = init_with_file("src/lib.rs", "only-one-line\n");
     let r = build_resolver(&fix);
