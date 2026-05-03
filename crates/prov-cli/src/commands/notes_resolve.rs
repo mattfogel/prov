@@ -254,7 +254,7 @@ fn merge_note_pair(
     }
 
     let mut merged: BTreeMap<EditKey, Edit> = BTreeMap::new();
-    for edit in local.edits.into_iter().chain(incoming.edits.into_iter()) {
+    for edit in local.edits.into_iter().chain(incoming.edits) {
         let key = EditKey::from_edit(&edit);
         match merged.get(&key) {
             Some(existing) if existing.timestamp >= edit.timestamp => {}
