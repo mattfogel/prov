@@ -85,6 +85,23 @@ with a commit/PR link).
 
 ---
 
+## docs/solutions — refresh hints
+
+- [ ] **Refresh `git-subprocess-hardening-conventions-2026-05-02.md` Pattern 7
+  when issue #29 lands.** Pattern 7 currently gives a manual `git reflog
+  expire --expire=now --all && git gc --prune=now` recipe as the remediation
+  for `prov redact-history` not scrubbing residuals. Once #29 ships a
+  built-in `prov gc-secrets` (or `prov redact-history --gc`), Pattern 7
+  becomes stale: it will describe a manual workflow the CLI now automates
+  and won't cross-reference the polarity convention in
+  `defensive-default-polarity-conventions-2026-05-03.md` that explains *why*
+  the prune cutoff has to be defensive. Verification: run
+  `/ce-compound-refresh git-subprocess-hardening-conventions-2026-05-02`
+  after #29 closes; confirm Pattern 7 names the new subcommand and links to
+  the polarity doc. Owner: whoever closes #29.
+
+---
+
 ## How to add an entry
 
 ```
