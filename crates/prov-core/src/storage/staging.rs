@@ -377,6 +377,14 @@ pub struct EditRecord {
     pub after: String,
     /// BLAKE3 hash of each line in `after`, parallel to `line_range`.
     pub content_hashes: Vec<String>,
+    /// Model that produced this edit, read from the transcript at capture
+    /// time. `None` for legacy records (and as a defensive fallback when the
+    /// transcript can't be read); the post-commit flush falls back to
+    /// `SessionMeta.model` in that case. Per-edit capture is required because
+    /// `SessionStart` only fires once per session, so a `/model` switch
+    /// mid-session would otherwise mis-attribute every later turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// ISO-8601 timestamp.
     pub timestamp: String,
 }
@@ -545,6 +553,7 @@ mod tests {
             before: String::new(),
             after: "hello\n".into(),
             content_hashes: vec![blake3::hash(b"hello").to_hex().to_string()],
+            model: None,
             timestamp: "2026-04-28T12:00:01Z".into(),
         }
     }

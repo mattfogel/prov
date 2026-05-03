@@ -362,6 +362,157 @@ fn end_to_end_post_commit_refreshes_sqlite_cache() {
 }
 
 #[test]
+fn note_records_per_turn_model_from_transcript_not_session_start_model() {
+    // Regression for issue #36: SessionStart only fires once per session, so a
+    // `/model` switch mid-session would otherwise mis-attribute every later
+    // edit. The PostToolUse handler reads the most recent assistant entry from
+    // the transcript and writes that model onto the EditRecord; the
+    // post-commit flush prefers it over SessionMeta.model.
+    let tmp = init_repo();
+    let root = tmp.path();
+
+    // Session starts in opus (the model field of session-start.json fixture).
+    fire_hook(root, "session-start", &read_fixture("session-start.json"));
+    fire_hook(
+        root,
+        "user-prompt-submit",
+        &read_fixture("user-prompt-submit.json"),
+    );
+
+    // Materialize the agent's edit on disk.
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let after = "pub fn hello() -> &'static str {\n    \"hello, prov\"\n}\n";
+    std::fs::write(root.join("src/lib.rs"), after).unwrap();
+
+    // The transcript contains an assistant message stamped with the model the
+    // user actually switched to. Real Claude Code transcripts mix message
+    // types; include a non-assistant entry to prove the scan skips it.
+    let transcript = root.join(".transcript.jsonl");
+    let transcript_body = format!(
+        "{}\n{}\n",
+        r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+        r#"{"type":"assistant","message":{"model":"claude-sonnet-4-6","role":"assistant","content":[]}}"#,
+    );
+    std::fs::write(&transcript, transcript_body).unwrap();
+
+    let payload = serde_json::json!({
+        "session_id": SID,
+        "tool_name": "Write",
+        "tool_use_id": "toolu_model",
+        "transcript_path": transcript.to_string_lossy(),
+        "tool_input": {
+            "file_path": root.join("src/lib.rs").to_string_lossy(),
+            "content": after,
+        },
+        "tool_response": {},
+    })
+    .to_string();
+    fire_hook(root, "post-tool-use", &payload);
+    fire_hook(root, "stop", &read_fixture("stop.json"));
+
+    run_git(root, &["add", "src/lib.rs"]);
+    run_git(root, &["commit", "-q", "-m", "feat: hello"]);
+    fire_hook(root, "post-commit", "");
+
+    let head = String::from_utf8(
+        Command::new("git")
+            .current_dir(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let show = Command::new("git")
+        .current_dir(root)
+        .args(["notes", "--ref", "refs/notes/prompts", "show", &head])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap();
+    let body = String::from_utf8(show.stdout).unwrap();
+    assert!(
+        body.contains("\"model\": \"claude-sonnet-4-6\""),
+        "note should carry the per-turn model from the transcript, not SessionStart's model: {body}"
+    );
+}
+
+#[test]
+fn note_falls_back_to_session_start_model_when_transcript_unavailable() {
+    // Defensive fallback: a missing or unreadable transcript must not leave
+    // the note with an empty/missing model — the SessionStart-captured model
+    // is the legacy behavior and remains the safety net.
+    let tmp = init_repo();
+    let root = tmp.path();
+
+    fire_hook(root, "session-start", &read_fixture("session-start.json"));
+    fire_hook(
+        root,
+        "user-prompt-submit",
+        &read_fixture("user-prompt-submit.json"),
+    );
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let after = "pub fn hello() -> &'static str {\n    \"hello, prov\"\n}\n";
+    std::fs::write(root.join("src/lib.rs"), after).unwrap();
+
+    // Point at a transcript that doesn't exist — the helper returns None.
+    let payload = serde_json::json!({
+        "session_id": SID,
+        "tool_name": "Write",
+        "tool_use_id": "toolu_fallback",
+        "transcript_path": "/no/such/transcript.jsonl",
+        "tool_input": {
+            "file_path": root.join("src/lib.rs").to_string_lossy(),
+            "content": after,
+        },
+        "tool_response": {},
+    })
+    .to_string();
+    fire_hook(root, "post-tool-use", &payload);
+    fire_hook(root, "stop", &read_fixture("stop.json"));
+
+    run_git(root, &["add", "src/lib.rs"]);
+    run_git(root, &["commit", "-q", "-m", "feat: hello"]);
+    fire_hook(root, "post-commit", "");
+
+    let head = String::from_utf8(
+        Command::new("git")
+            .current_dir(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let show = Command::new("git")
+        .current_dir(root)
+        .args(["notes", "--ref", "refs/notes/prompts", "show", &head])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap();
+    let body = String::from_utf8(show.stdout).unwrap();
+    // session-start.json fixture's model field is the SessionStart fallback.
+    let expected = read_fixture("session-start.json");
+    let model_value: serde_json::Value = serde_json::from_str(&expected).unwrap();
+    let session_start_model = model_value
+        .get("model")
+        .and_then(|v| v.as_str())
+        .expect("session-start fixture missing model field");
+    assert!(
+        body.contains(&format!("\"model\": \"{session_start_model}\"")),
+        "note should fall back to SessionStart model when transcript is unavailable: {body}"
+    );
+}
+
+#[test]
 fn end_to_end_capture_handles_absolute_file_path_in_tool_input() {
     // Real Claude Code passes absolute paths in `file_path`. Earlier the
     // matcher keyed on those absolute paths and `git diff` keyed on relative

@@ -474,6 +474,7 @@ fn cherry_pick_stamps_derived_from_via_post_commit() {
                 before: String::new(),
                 after: "picked\n".into(),
                 content_hashes: vec![blake3::hash(b"picked").to_hex().to_string()],
+                model: None,
                 timestamp: "2026-04-28T12:00:00Z".into(),
             },
         )
