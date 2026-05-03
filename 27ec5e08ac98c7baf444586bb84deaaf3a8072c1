@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "edits": [
+    {
+      "file": "crates/prov-cli/src/commands/notes_resolve.rs",
+      "line_range": [
+        257,
+        257
+      ],
+      "content_hashes": [
+        "e4dfbe5fbc0b5b26ae2bb44047049cdaac577c5efa481ae98e516cd8d75bb767"
+      ],
+      "prompt": "ci is red on the pr",
+      "conversation_id": "75fd43c7-52f6-480c-b581-58317b5582b1",
+      "turn_index": 3,
+      "tool_use_id": "toolu_01H3sgUYDgvs8hRMQjTRWdP4",
+      "model": "unknown",
+      "tool": "claude-code",
+      "timestamp": "2026-05-03T15:53:12Z"
+    }
+  ]
+}
