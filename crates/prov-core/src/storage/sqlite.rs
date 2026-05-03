@@ -119,8 +119,11 @@ impl Cache {
         Ok(v)
     }
 
-    #[cfg(test)]
-    fn set_recorded_notes_ref_sha(&self, sha: Option<&str>) -> Result<(), CacheError> {
+    /// Stamp the recorded notes-ref SHA without touching any note rows. Used by
+    /// callers that mutated the notes ref out-of-band (e.g., post-rewrite
+    /// migrating notes between SHAs) and want subsequent cache reads to skip
+    /// the drift-detection reindex.
+    pub fn set_recorded_notes_ref_sha(&self, sha: Option<&str>) -> Result<(), CacheError> {
         match sha {
             Some(s) => {
                 self.conn.execute(

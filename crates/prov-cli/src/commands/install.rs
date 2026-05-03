@@ -41,6 +41,11 @@ const POST_COMMIT_TEMPLATE: &str = include_str!("../../../../githooks/post-commi
 /// `prov.scanAllPushes`, any push) reach the wire.
 const PRE_PUSH_TEMPLATE: &str = include_str!("../../../../githooks/pre-push");
 
+/// Embedded post-rewrite hook template. Source: `githooks/post-rewrite`. Owns
+/// U9's amend/rebase/squash note migration; without it, notes attached to a
+/// pre-rewrite commit would orphan when git replaced the SHA.
+const POST_REWRITE_TEMPLATE: &str = include_str!("../../../../githooks/post-rewrite");
+
 /// Embedded plugin/hooks/hooks.json so `--plugin`-less installs can mirror the
 /// plugin's hook entries into project-scope `.claude/settings.json`.
 const PLUGIN_HOOKS_JSON: &str = include_str!("../../../../plugin/hooks/hooks.json");
@@ -84,6 +89,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     install_hook(&pre_push_path, PRE_PUSH_TEMPLATE)
         .with_context(|| format!("installing {}", pre_push_path.display()))?;
 
+    let post_rewrite_path = git.git_dir().join("hooks").join("post-rewrite");
+    install_hook(&post_rewrite_path, POST_REWRITE_TEMPLATE)
+        .with_context(|| format!("installing {}", post_rewrite_path.display()))?;
+
     install_claude_settings(&git).context("merging prov entries into .claude/settings.json")?;
 
     if let Some(remote) = args.enable_push.as_deref() {
@@ -97,6 +106,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     println!("prov: installed in {}", git.work_tree().display());
     println!("  hooks:    {}", hook_path.display());
     println!("  hooks:    {}", pre_push_path.display());
+    println!("  hooks:    {}", post_rewrite_path.display());
     println!("  cache:    {}", cache_path.display());
     println!("  settings: {}", claude_settings_path(&git).display());
     if let Some(remote) = args.enable_push {
