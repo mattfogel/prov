@@ -3,10 +3,10 @@
 //! Each test sets up a local repo + a bare "remote" repo, drives the binary
 //! directly, and inspects the resulting notes refs.
 
-use std::path::Path;
-use std::process::Command;
+mod common;
 
-use assert_cmd::Command as AssertCommand;
+use std::path::Path;
+
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -15,32 +15,7 @@ use prov_core::schema::{Edit, Note};
 use prov_core::storage::notes::NotesStore;
 use prov_core::storage::NOTES_REF_PUBLIC;
 
-fn run_git(cwd: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .current_dir(cwd)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .status()
-        .expect("git");
-    assert!(status.success(), "git {args:?} failed");
-}
-
-fn git_capture(cwd: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
-        .current_dir(cwd)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
-        .expect("git")
-}
-
-fn head_sha(cwd: &Path) -> String {
-    let out = git_capture(cwd, &["rev-parse", "HEAD"]);
-    assert!(out.status.success());
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
-}
+use common::{git_capture, head_sha, init_bare_remote, prov_in, run_git};
 
 fn init_repo() -> TempDir {
     let tmp = TempDir::new().unwrap();
@@ -49,20 +24,6 @@ fn init_repo() -> TempDir {
     run_git(root, &["config", "--local", "user.email", "t@x.com"]);
     run_git(root, &["config", "--local", "user.name", "T"]);
     tmp
-}
-
-fn init_bare_remote() -> TempDir {
-    let tmp = TempDir::new().unwrap();
-    run_git(tmp.path(), &["init", "-q", "--bare"]);
-    tmp
-}
-
-fn prov_in(cwd: &Path) -> AssertCommand {
-    let mut c = AssertCommand::cargo_bin("prov").unwrap();
-    c.current_dir(cwd)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null");
-    c
 }
 
 fn make_edit(file: &str, prompt: &str, hashes: Vec<String>) -> Edit {
