@@ -6,6 +6,7 @@
 //! can depend on this crate without inheriting the CLI's surface.
 
 pub mod git;
+pub mod privacy;
 pub mod redactor;
 pub mod resolver;
 pub mod schema;

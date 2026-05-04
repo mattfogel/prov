@@ -150,6 +150,22 @@ pub enum DerivedFrom {
     Unknown,
 }
 
+impl DerivedFrom {
+    /// Convenience: `(true, Some(confidence))` when the edit was reconstructed
+    /// by `prov backfill`, `(false, None)` otherwise. Shared by every read
+    /// surface (`prov log`, `prov search`, `prov pr-timeline`, the GitHub
+    /// Action) so a backfilled note always renders with the `(approximate)`
+    /// marker — a backfilled prompt that surfaces as a live capture violates
+    /// the R14 contract.
+    #[must_use]
+    pub fn approximate_fields(derived: Option<&Self>) -> (bool, Option<f32>) {
+        match derived {
+            Some(DerivedFrom::Backfill { confidence, .. }) => (true, Some(*confidence)),
+            _ => (false, None),
+        }
+    }
+}
+
 /// Errors raised by schema parsing.
 #[derive(Debug, thiserror::Error)]
 pub enum SchemaError {

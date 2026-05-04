@@ -442,7 +442,7 @@ impl PointJson {
                 ..
             } => {
                 let (approximate, approximate_confidence) =
-                    approximate_fields(derived_from.as_ref());
+                    DerivedFrom::approximate_fields(derived_from.as_ref());
                 Self {
                     file,
                     line,
@@ -472,7 +472,7 @@ impl PointJson {
                 ..
             } => {
                 let (approximate, approximate_confidence) =
-                    approximate_fields(derived_from.as_ref());
+                    DerivedFrom::approximate_fields(derived_from.as_ref());
                 Self {
                     file,
                     line,
@@ -510,13 +510,6 @@ impl PointJson {
     }
 }
 
-fn approximate_fields(derived: Option<&DerivedFrom>) -> (bool, Option<f32>) {
-    match derived {
-        Some(DerivedFrom::Backfill { confidence, .. }) => (true, Some(*confidence)),
-        _ => (false, None),
-    }
-}
-
 #[derive(Serialize)]
 struct WholeFileJson {
     file: String,
@@ -545,7 +538,7 @@ struct EditJson {
 
 impl EditJson {
     fn from_row(row: &prov_core::storage::sqlite::EditRow, derived: Option<&DerivedFrom>) -> Self {
-        let (approximate, approximate_confidence) = approximate_fields(derived);
+        let (approximate, approximate_confidence) = DerivedFrom::approximate_fields(derived);
         Self {
             commit_sha: row.commit_sha.clone(),
             line_start: row.line_start,
@@ -561,7 +554,7 @@ impl EditJson {
 
     fn from_history(h: &HistoryEntry) -> Self {
         let (approximate, approximate_confidence) =
-            approximate_fields(h.edit.derived_from.as_ref());
+            DerivedFrom::approximate_fields(h.edit.derived_from.as_ref());
         Self {
             commit_sha: h.commit_sha.clone(),
             line_start: h.edit.line_range[0],

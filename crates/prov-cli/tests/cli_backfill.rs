@@ -17,7 +17,7 @@ use tempfile::TempDir;
 use prov_core::git::Git;
 use prov_core::schema::{DerivedFrom, Edit, Note};
 use prov_core::storage::notes::NotesStore;
-use prov_core::storage::NOTES_REF_PUBLIC;
+use prov_core::storage::{NOTES_REF_PRIVATE, NOTES_REF_PUBLIC};
 
 fn run_git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -281,6 +281,193 @@ fn redacts_secrets_in_backfilled_prompts() {
         "redactor should have stamped a marker; prompt was: {}",
         edit.prompt
     );
+}
+
+// ============================================================
+// --json envelope
+// ============================================================
+
+#[test]
+fn json_flag_emits_structured_envelope_with_closed_status_vocab() {
+    // Per defensive-default-polarity §5: write/admin commands ship --json
+    // from day one with closed-vocabulary statuses. Regression for the U15
+    // review's PS-01.
+    let tmp = init_repo();
+    let file_abs = tmp.path().join("a.txt").to_string_lossy().into_owned();
+    let contents = "alpha\nbeta\n";
+    let _sha = commit_file(tmp.path(), "a.txt", contents, "feat: a");
+
+    let transcripts = TempDir::new().unwrap();
+    let transcript_path = write_transcript(
+        transcripts.path(),
+        "sess-json",
+        "2026-04-28T12:00:00Z",
+        &tmp.path().to_string_lossy(),
+        &file_abs,
+        contents,
+        "create alpha-beta",
+    );
+
+    let out = prov_in(tmp.path())
+        .args([
+            "backfill",
+            "--yes",
+            "--json",
+            "--transcript-path",
+            &transcript_path.to_string_lossy(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body = String::from_utf8(out).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body).expect("--json must be valid JSON");
+
+    assert_eq!(v["written"], serde_json::json!(1));
+    assert_eq!(v["scanned"], serde_json::json!(1));
+    assert!(v["prov_version"].is_string());
+    let outcomes = v["outcomes"].as_array().expect("outcomes array");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0]["status"], serde_json::json!("written"));
+    assert_eq!(outcomes[0]["session_id"], serde_json::json!("sess-json"));
+    assert!(outcomes[0]["commit_sha"].is_string());
+    assert!(outcomes[0]["confidence"].is_number());
+}
+
+// ============================================================
+// Multi-session merge
+// ============================================================
+
+#[test]
+fn two_sessions_targeting_one_commit_both_survive() {
+    // Weekend stop-and-resume → Monday squash: two distinct Claude Code
+    // sessions both contribute the lines that end up in a single commit.
+    // Backfill must merge both sessions' edits onto that commit instead of
+    // letting the second `git notes add --force` clobber the first.
+    // Regression for the U15 review's correctness #002.
+    let tmp = init_repo();
+    let file_abs = tmp.path().join("file.txt").to_string_lossy().into_owned();
+    let contents = "alpha\nbeta\ngamma\ndelta\n";
+    let sha = commit_file(tmp.path(), "file.txt", contents, "feat: file");
+
+    // Two transcripts, distinct session IDs, same content + file → both will
+    // match the same commit at confidence 1.0. The first run writes the note;
+    // the second goes through the backfill-merge path.
+    let transcripts = TempDir::new().unwrap();
+    let alice = write_transcript(
+        transcripts.path(),
+        "sess-alice",
+        "2026-04-28T12:00:00Z",
+        &tmp.path().to_string_lossy(),
+        &file_abs,
+        contents,
+        "create the file",
+    );
+    let bob = write_transcript(
+        transcripts.path(),
+        "sess-bob",
+        "2026-04-28T12:05:00Z",
+        &tmp.path().to_string_lossy(),
+        &file_abs,
+        contents,
+        "create the file again from a different session",
+    );
+
+    prov_in(tmp.path())
+        .args([
+            "backfill",
+            "--yes",
+            "--transcript-path",
+            &alice.to_string_lossy(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("backfilled"));
+    prov_in(tmp.path())
+        .args([
+            "backfill",
+            "--yes",
+            "--transcript-path",
+            &bob.to_string_lossy(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("backfilled"));
+
+    let git = Git::discover(tmp.path()).unwrap();
+    let store = NotesStore::new(git, NOTES_REF_PUBLIC);
+    let note = store.read(&sha).unwrap().expect("note");
+    let session_ids: std::collections::BTreeSet<&str> = note
+        .edits
+        .iter()
+        .map(|e| e.conversation_id.as_str())
+        .collect();
+    assert!(
+        session_ids.contains("sess-alice"),
+        "alice's edits were clobbered by bob's backfill (sessions: {session_ids:?})",
+    );
+    assert!(
+        session_ids.contains("sess-bob"),
+        "bob's edits were not written (sessions: {session_ids:?})",
+    );
+}
+
+// ============================================================
+// Privacy routing
+// ============================================================
+
+#[test]
+fn private_marker_routes_to_private_ref_not_public() {
+    // A `# prov:private` first-line opt-out in the live capture pipeline
+    // routes the prompt to refs/notes/prompts-private (a local-only ref). The
+    // backfill path must honor the same routing — otherwise a
+    // reconstructed-from-transcript prompt for a turn the user explicitly
+    // marked private leaks to the pushable refs/notes/prompts and ends up on
+    // the next `prov push`. Regression for the U15 review's P0.
+    let tmp = init_repo();
+    let file_abs = tmp.path().join("secret.txt").to_string_lossy().into_owned();
+    let contents = "rotation key 123\n";
+    let sha = commit_file(tmp.path(), "secret.txt", contents, "chore: rotate");
+
+    let transcripts = TempDir::new().unwrap();
+    let transcript_path = write_transcript(
+        transcripts.path(),
+        "sess-private",
+        "2026-04-28T12:00:00Z",
+        &tmp.path().to_string_lossy(),
+        &file_abs,
+        contents,
+        "# prov:private\nrotate the staging credentials",
+    );
+
+    prov_in(tmp.path())
+        .args([
+            "backfill",
+            "--yes",
+            "--transcript-path",
+            &transcript_path.to_string_lossy(),
+        ])
+        .assert()
+        .success();
+
+    let git = Git::discover(tmp.path()).unwrap();
+    let public = NotesStore::new(git.clone(), NOTES_REF_PUBLIC);
+    let private = NotesStore::new(git, NOTES_REF_PRIVATE);
+    assert!(
+        public.read(&sha).unwrap().is_none(),
+        "private prompt must not land on the public ref",
+    );
+    let priv_note = private
+        .read(&sha)
+        .unwrap()
+        .expect("private prompt should land on the private ref");
+    assert_eq!(priv_note.edits.len(), 1);
+    assert!(priv_note.edits[0].prompt.contains("rotate the staging"));
+    assert!(matches!(
+        priv_note.edits[0].derived_from,
+        Some(DerivedFrom::Backfill { .. })
+    ));
 }
 
 // ============================================================

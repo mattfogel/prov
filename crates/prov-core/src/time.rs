@@ -19,6 +19,24 @@ pub fn now_iso8601() -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+/// Convert civil `(year, month, day, hour, minute, second)` to a UNIX-epoch
+/// second count.
+///
+/// Howard Hinnant's `days_from_civil`, the inverse of [`epoch_to_civil`].
+/// Variable names follow the canonical paper for cross-reference. Pure
+/// integer arithmetic; safe for the entire i64 epoch range.
+#[allow(clippy::similar_names, clippy::many_single_char_names)]
+#[must_use]
+pub fn civil_to_epoch(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    days * 86_400 + hour * 3600 + minute * 60 + second
+}
+
 /// Convert a UNIX-epoch second count to civil `(year, month, day, hour,
 /// minute, second)`.
 ///
@@ -67,5 +85,28 @@ mod tests {
         assert_eq!(epoch_to_civil(1_704_067_200), (2024, 1, 1, 0, 0, 0));
         // 2026-04-28T12:34:56Z = 1_777_379_696
         assert_eq!(epoch_to_civil(1_777_379_696), (2026, 4, 28, 12, 34, 56));
+    }
+
+    #[test]
+    fn civil_to_epoch_handles_known_values() {
+        assert_eq!(civil_to_epoch(1970, 1, 1, 0, 0, 0), 0);
+        assert_eq!(civil_to_epoch(2024, 1, 1, 0, 0, 0), 1_704_067_200);
+        assert_eq!(civil_to_epoch(2026, 4, 28, 12, 34, 56), 1_777_379_696);
+    }
+
+    #[test]
+    fn civil_to_epoch_is_inverse_of_epoch_to_civil() {
+        for &secs in &[0_u64, 1_704_067_200, 1_777_379_696, 2_524_608_000] {
+            let (year, month, day, hour, minute, second) = epoch_to_civil(secs);
+            let back = civil_to_epoch(
+                i64::from(year),
+                i64::from(month),
+                i64::from(day),
+                i64::from(hour),
+                i64::from(minute),
+                i64::from(second),
+            );
+            assert_eq!(back, i64::try_from(secs).unwrap(), "round-trip @ {secs}");
+        }
     }
 }

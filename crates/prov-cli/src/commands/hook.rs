@@ -29,6 +29,7 @@ use clap::{Parser, Subcommand};
 use serde::Deserialize;
 
 use prov_core::git::{Git, GitError};
+use prov_core::privacy::is_prov_private;
 use prov_core::redactor::Redactor;
 use prov_core::schema::{DerivedFrom, Edit, Note};
 use prov_core::session::SessionId;
@@ -159,6 +160,8 @@ fn handle_user_prompt_submit(staging: &Staging) -> Result<(), HandlerError> {
 
     // First/last-line `# prov:private` opt-out (case-insensitive). A
     // `# prov:private` inside a code-block paste does not flip the routing.
+    // Predicate lives in prov_core::privacy so `prov backfill` honors the
+    // same routing rule when reconstructing prompts from transcripts.
     let private = is_prov_private(&prompt);
 
     // Redact even staged content. The redactor is the primary defense; pre-push
@@ -179,26 +182,6 @@ fn handle_user_prompt_submit(staging: &Staging) -> Result<(), HandlerError> {
     };
     staging.write_turn(&sid, private, turn_index, &record)?;
     Ok(())
-}
-
-/// True when the prompt's first or last line is the magic phrase
-/// `# prov:private` (case-insensitive). Restricted to first/last lines so a
-/// paste of code that contains `# prov:private` inside a code block does not
-/// silently flip the privacy bit.
-fn is_prov_private(prompt: &str) -> bool {
-    let lines: Vec<&str> = prompt.lines().collect();
-    if lines.first().is_some_and(|l| line_is_prov_private(l)) {
-        return true;
-    }
-    lines.last().is_some_and(|l| line_is_prov_private(l))
-}
-
-fn line_is_prov_private(line: &str) -> bool {
-    let trimmed = line.trim();
-    let Some(rest) = trimmed.strip_prefix('#') else {
-        return false;
-    };
-    rest.trim().eq_ignore_ascii_case("prov:private")
 }
 
 // =================================================================
@@ -1496,18 +1479,9 @@ fn read_stdin_json<T: for<'de> Deserialize<'de>>() -> Result<T, HandlerError> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn prov_private_first_line_only() {
-        assert!(is_prov_private("# prov:private\nfoo bar"));
-        assert!(is_prov_private("foo\n# prov:private"));
-        assert!(is_prov_private("# Prov:Private\nfoo"));
-        assert!(is_prov_private("# PROV:PRIVATE"));
-        assert!(is_prov_private("foo\n# PROV:PRIVATE"));
-        // Inside the body but not first/last line — does NOT trigger.
-        assert!(!is_prov_private("foo\n# prov:private\nbar"));
-        // Substring inside text — no trigger.
-        assert!(!is_prov_private("write a parser for # prov:private syntax"));
-    }
+    // Behavioral coverage of `is_prov_private` lives in
+    // `prov_core::privacy`'s unit tests. The hook's job here is only to
+    // route on the predicate's verdict — see `private` at line 165.
 
     #[test]
     fn decompose_edit_produces_one_record() {

@@ -101,14 +101,29 @@ pub enum TranscriptError {
     Io(String),
 }
 
+/// Cap on transcript file size, mirroring the live-capture hook payload cap
+/// (`hook.rs::MAX_PAYLOAD_BYTES`). Files larger than this fail loud rather
+/// than OOMing the runner — a multi-GB transcript or symlink under
+/// `~/.claude/projects/` would otherwise read into a single `String`.
+const MAX_TRANSCRIPT_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Parse a single Claude Code session transcript file.
 ///
 /// Best-effort: malformed JSON lines are silently skipped. Returns
 /// `ParsedSession` with empty turns/edits if the file is empty or carries no
-/// recognizable events.
+/// recognizable events. Refuses files larger than `MAX_TRANSCRIPT_BYTES`.
 pub fn parse_transcript(path: impl AsRef<Path>) -> Result<ParsedSession, TranscriptError> {
-    let raw =
-        std::fs::read_to_string(path.as_ref()).map_err(|e| TranscriptError::Io(e.to_string()))?;
+    let path = path.as_ref();
+    let meta = std::fs::metadata(path).map_err(|e| TranscriptError::Io(e.to_string()))?;
+    if meta.len() > MAX_TRANSCRIPT_BYTES {
+        return Err(TranscriptError::Io(format!(
+            "transcript {} is {} bytes; refusing files larger than {} bytes (set in transcript.rs)",
+            path.display(),
+            meta.len(),
+            MAX_TRANSCRIPT_BYTES
+        )));
+    }
+    let raw = std::fs::read_to_string(path).map_err(|e| TranscriptError::Io(e.to_string()))?;
     Ok(parse_transcript_text(&raw))
 }
 

@@ -24,12 +24,15 @@ use anyhow::{anyhow, Context};
 use clap::Parser;
 
 use prov_core::git::{Git, GitError};
+use prov_core::privacy::is_prov_private;
 use prov_core::redactor::Redactor;
 use prov_core::schema::{DerivedFrom, Edit, Note};
 use prov_core::storage::notes::NotesStore;
 use prov_core::storage::sqlite::Cache;
-use prov_core::storage::NOTES_REF_PUBLIC;
+use prov_core::storage::{NOTES_REF_PRIVATE, NOTES_REF_PUBLIC};
+use prov_core::time::civil_to_epoch;
 use prov_core::transcript::{parse_transcript, ParsedEdit, ParsedSession, TranscriptError};
+use serde::Serialize;
 
 use super::common::CACHE_FILENAME;
 
@@ -47,6 +50,11 @@ pub struct Args {
     /// Override the auto-discovered Claude Code transcript directory or file.
     #[arg(long, value_name = "PATH")]
     pub transcript_path: Option<String>,
+    /// Emit a structured JSON envelope instead of human text. Required of every
+    /// write/admin command per defensive-default-polarity §5 so agents and
+    /// downstream tooling can parse outcomes without scraping prose.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Confidence floor. Sessions below this score are skipped unless the user
@@ -71,55 +79,149 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let transcripts = discover_transcripts(&git, args.transcript_path.as_deref())?;
     if transcripts.files.is_empty() {
+        if args.json {
+            // Empty-set still emits a valid envelope so consumers can branch
+            // on `scanned == 0` without the parser tripping on free text.
+            let payload = BackfillJson {
+                scanned: 0,
+                written: 0,
+                skipped_no_match: 0,
+                skipped_low_confidence: 0,
+                skipped_existing_live: 0,
+                skipped_cross_author: 0,
+                outcomes: Vec::new(),
+                prov_version: env!("CARGO_PKG_VERSION"),
+            };
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+            return Ok(());
+        }
         println!(
             "prov backfill: no transcript files found under {}",
             transcripts.source.display()
         );
         return Ok(());
     }
-    confirm_or_bail(&transcripts, args.yes)?;
+    confirm_or_bail(&transcripts, args.yes, args.json)?;
+
+    // git config user.email is what the cross-author guard compares against;
+    // unset → guard cannot run. Treat that as a hard error rather than silently
+    // bypassing the safety, per defensive-default-polarity. The user opts out
+    // explicitly with --cross-author.
+    let user_email = git
+        .capture(["config", "user.email"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if user_email.is_empty() && !args.cross_author {
+        return Err(anyhow!(
+            "git config user.email is unset; backfill cannot verify commit authorship.\n\
+             Set it with `git config user.email <email>`, or pass --cross-author to proceed without the check."
+        ));
+    }
 
     let ctx = RunCtx {
-        user_email: git
-            .capture(["config", "user.email"])
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default(),
+        user_email,
         floor: if args.include_low_confidence {
             0.0
         } else {
             DEFAULT_CONFIDENCE_FLOOR
         },
         cross_author: args.cross_author,
-        store: NotesStore::new(git.clone(), NOTES_REF_PUBLIC),
+        json: args.json,
+        public_store: NotesStore::new(git.clone(), NOTES_REF_PUBLIC),
+        // Per-turn `# prov:private` opt-out routes individual edits to the
+        // local-only private ref, mirroring the live capture pipeline. A commit
+        // with mixed-privacy turns ends up with notes on both refs.
+        private_store: NotesStore::new(git.clone(), NOTES_REF_PRIVATE),
         cache_path: git.git_dir().join(CACHE_FILENAME),
         redactor: Redactor::new(),
         candidates: load_candidate_commits(&git)?,
     };
 
-    let mut counts = RunCounts::default();
+    let mut report = RunReport::default();
     for transcript_path in &transcripts.files {
-        process_transcript(transcript_path, &ctx, &mut counts);
+        process_transcript(transcript_path, &ctx, &mut report);
     }
 
-    println!(
-        "prov backfill: {} note(s) written; {} session(s) without a match, \
-         {} below confidence floor, \
-         {} commit(s) already carry live notes, \
-         {} commit(s) cross-author",
-        counts.written,
-        counts.skipped_no_match,
-        counts.skipped_low_confidence,
-        counts.skipped_existing_live,
-        counts.skipped_cross_author,
-    );
+    if args.json {
+        let payload = BackfillJson {
+            scanned: u32::try_from(transcripts.files.len()).unwrap_or(u32::MAX),
+            written: report.counts.written,
+            skipped_no_match: report.counts.skipped_no_match,
+            skipped_low_confidence: report.counts.skipped_low_confidence,
+            skipped_existing_live: report.counts.skipped_existing_live,
+            skipped_cross_author: report.counts.skipped_cross_author,
+            outcomes: report.outcomes,
+            prov_version: env!("CARGO_PKG_VERSION"),
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!(
+            "prov backfill: {} note(s) written; {} session(s) without a match, \
+             {} below confidence floor, \
+             {} commit(s) already carry live notes, \
+             {} commit(s) cross-author",
+            report.counts.written,
+            report.counts.skipped_no_match,
+            report.counts.skipped_low_confidence,
+            report.counts.skipped_existing_live,
+            report.counts.skipped_cross_author,
+        );
+    }
     Ok(())
+}
+
+#[derive(Default)]
+struct RunReport {
+    counts: RunCounts,
+    outcomes: Vec<BackfillOutcome>,
+}
+
+/// One per-session outcome the JSON envelope reports. `status` uses a closed
+/// vocabulary so consumers can branch on outcome without parsing free text.
+#[derive(Serialize)]
+struct BackfillOutcome {
+    /// Basename of the transcript JSONL the session came from.
+    transcript: String,
+    /// Claude Code session id.
+    session_id: String,
+    /// Closed-vocabulary outcome: one of `written`, `skipped-no-match`,
+    /// `skipped-low-confidence`, `skipped-existing-live`,
+    /// `skipped-cross-author`, `parse-failed`.
+    status: &'static str,
+    /// Commit the note was attached to (only set on `written`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit_sha: Option<String>,
+    /// Match confidence in `[0.0, 1.0]` (only set when a match was scored).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<f32>,
+    /// True when at least one of the session's edits routed to the private
+    /// ref via the `# prov:private` magic phrase.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    private: bool,
+}
+
+#[derive(Serialize)]
+struct BackfillJson {
+    scanned: u32,
+    written: u32,
+    skipped_no_match: u32,
+    skipped_low_confidence: u32,
+    skipped_existing_live: u32,
+    skipped_cross_author: u32,
+    outcomes: Vec<BackfillOutcome>,
+    prov_version: &'static str,
 }
 
 struct RunCtx {
     user_email: String,
     floor: f32,
     cross_author: bool,
-    store: NotesStore,
+    /// True when the run is producing a JSON envelope; suppresses the per-
+    /// session "backfilled X ← Y" stdout lines so they don't pollute the
+    /// JSON. The outcomes array carries the same information structurally.
+    json: bool,
+    public_store: NotesStore,
+    private_store: NotesStore,
     cache_path: PathBuf,
     redactor: Redactor,
     candidates: Vec<CommitMeta>,
@@ -134,11 +236,36 @@ struct RunCounts {
     skipped_cross_author: u32,
 }
 
-fn process_transcript(transcript_path: &Path, ctx: &RunCtx, counts: &mut RunCounts) {
+// Per-session orchestration is naturally long: parse → match → confidence
+// gate → cross-author guard → privacy partition → write public+private. The
+// 100-line cap is a useful default but here splitting into 5-line helpers
+// would only obscure the linear shape of the pipeline.
+#[allow(clippy::too_many_lines)]
+fn process_transcript(transcript_path: &Path, ctx: &RunCtx, report: &mut RunReport) {
+    let transcript_basename = transcript_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut record = |status: &'static str,
+                      session_id: &str,
+                      commit_sha: Option<String>,
+                      confidence: Option<f32>,
+                      private: bool| {
+        report.outcomes.push(BackfillOutcome {
+            transcript: transcript_basename.clone(),
+            session_id: session_id.to_string(),
+            status,
+            commit_sha,
+            confidence,
+            private,
+        });
+    };
+
     let session = match parse_transcript(transcript_path) {
         Ok(s) => s,
         Err(TranscriptError::Io(msg)) => {
             eprintln!("warning: skipping {}: {msg}", transcript_path.display());
+            record("parse-failed", "", None, None, false);
             return;
         }
     };
@@ -146,64 +273,181 @@ fn process_transcript(transcript_path: &Path, ctx: &RunCtx, counts: &mut RunCoun
         return;
     }
     let Some(best) = best_match(&session, &ctx.candidates) else {
-        counts.skipped_no_match += 1;
+        report.counts.skipped_no_match += 1;
+        record("skipped-no-match", &session.session_id, None, None, false);
         return;
     };
     if best.confidence < ctx.floor {
-        counts.skipped_low_confidence += 1;
+        report.counts.skipped_low_confidence += 1;
+        record(
+            "skipped-low-confidence",
+            &session.session_id,
+            Some(best.candidate.sha.clone()),
+            Some(best.confidence),
+            false,
+        );
         return;
     }
+    // user_email is non-empty here: run() refused to start with a missing
+    // user.email unless --cross-author was set, so the guard always has a real
+    // identity to compare against.
     if !ctx.cross_author
-        && !ctx.user_email.is_empty()
         && !best
             .candidate
             .author_email
             .eq_ignore_ascii_case(&ctx.user_email)
     {
-        counts.skipped_cross_author += 1;
+        report.counts.skipped_cross_author += 1;
         eprintln!(
             "skipping {}: commit author {} != {} (pass --cross-author to override)",
             short_sha(&best.candidate.sha),
             best.candidate.author_email,
             ctx.user_email,
         );
-        return;
-    }
-    match ctx.store.read(&best.candidate.sha) {
-        Ok(Some(existing)) if !is_backfill_only(&existing) => {
-            counts.skipped_existing_live += 1;
-            return;
-        }
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!(
-                "warning: could not read existing note for {}: {e}",
-                short_sha(&best.candidate.sha)
-            );
-            return;
-        }
-    }
-    let edits = build_note_edits(&session, &best, transcript_path, &ctx.redactor);
-    if edits.is_empty() {
-        counts.skipped_no_match += 1;
-        return;
-    }
-    let note = Note::new(edits);
-    if let Err(e) = ctx.store.write(&best.candidate.sha, &note) {
-        eprintln!(
-            "warning: failed to write note for {}: {e}",
-            short_sha(&best.candidate.sha)
+        record(
+            "skipped-cross-author",
+            &session.session_id,
+            Some(best.candidate.sha.clone()),
+            Some(best.confidence),
+            false,
         );
         return;
     }
-    update_cache(&ctx.cache_path, &ctx.store, &best.candidate.sha, &note);
-    counts.written += 1;
-    println!(
-        "backfilled {} ← session {} (confidence {:.2})",
-        short_sha(&best.candidate.sha),
-        short_session(&session.session_id),
-        best.confidence,
+    let (public_edits, private_edits) =
+        build_note_edits(&session, &best, transcript_path, &ctx.redactor);
+    if public_edits.is_empty() && private_edits.is_empty() {
+        report.counts.skipped_no_match += 1;
+        record(
+            "skipped-no-match",
+            &session.session_id,
+            Some(best.candidate.sha.clone()),
+            Some(best.confidence),
+            false,
+        );
+        return;
+    }
+
+    // Each ref is independent: a commit may carry public + private notes
+    // simultaneously (mixed-privacy turns). Each side gets its own
+    // existing-live check + write so a live note on one ref doesn't block
+    // the other side from being backfilled.
+    let mut wrote_any = false;
+    let mut wrote_private = false;
+    if !public_edits.is_empty() {
+        wrote_any |= write_backfill_note(
+            &ctx.public_store,
+            &ctx.cache_path,
+            &best.candidate.sha,
+            public_edits,
+            &mut report.counts,
+        );
+    }
+    if !private_edits.is_empty()
+        && write_backfill_note(
+            &ctx.private_store,
+            &ctx.cache_path,
+            &best.candidate.sha,
+            private_edits,
+            &mut report.counts,
+        )
+    {
+        wrote_any = true;
+        wrote_private = true;
+    }
+    if !wrote_any {
+        // write_backfill_note already incremented skipped_existing_live when
+        // it refused to overwrite a live note; record the outcome to match.
+        record(
+            "skipped-existing-live",
+            &session.session_id,
+            Some(best.candidate.sha.clone()),
+            Some(best.confidence),
+            false,
+        );
+        return;
+    }
+    report.counts.written += 1;
+    record(
+        "written",
+        &session.session_id,
+        Some(best.candidate.sha.clone()),
+        Some(best.confidence),
+        wrote_private,
     );
+    if !ctx.json {
+        let suffix = if wrote_private { " [private]" } else { "" };
+        println!(
+            "backfilled {} ← session {} (confidence {:.2}){}",
+            short_sha(&best.candidate.sha),
+            short_session(&session.session_id),
+            best.confidence,
+            suffix,
+        );
+    }
+}
+
+/// Write `new_edits` as a backfill note on `store`, honoring the existing-live
+/// guard (refuse to overwrite a live note on this ref). When the prior note is
+/// itself backfill-only, merges the prior edits with the new ones (deduped by
+/// session/turn/file/line-range) so a second transcript targeting the same
+/// commit does not silently clobber the first via `git notes add --force`.
+/// Returns true when the note was written. Side-effects on `counts` track the
+/// safety-interlock skips.
+fn write_backfill_note(
+    store: &NotesStore,
+    cache_path: &Path,
+    sha: &str,
+    new_edits: Vec<Edit>,
+    counts: &mut RunCounts,
+) -> bool {
+    let merged = match store.read(sha) {
+        Ok(Some(existing)) if !is_backfill_only(&existing) => {
+            counts.skipped_existing_live += 1;
+            return false;
+        }
+        Ok(Some(existing)) => merge_backfill_edits(existing.edits, new_edits),
+        Ok(None) => new_edits,
+        Err(e) => {
+            eprintln!(
+                "warning: could not read existing note for {}: {e}",
+                short_sha(sha)
+            );
+            return false;
+        }
+    };
+    let note = Note::new(merged);
+    if let Err(e) = store.write(sha, &note) {
+        eprintln!("warning: failed to write note for {}: {e}", short_sha(sha));
+        return false;
+    }
+    update_cache(cache_path, store, sha, &note);
+    true
+}
+
+/// Union prior + new backfill edits, removing duplicates that share the same
+/// (`conversation_id`, `turn_index`, `file`, `line_range`) tuple. The dedup
+/// key keeps idempotent re-runs of the same transcript single-copy while
+/// preserving distinct sessions targeting the same commit (different
+/// `conversation_id`s never collide). Insertion order is prior-first so a
+/// re-run of the same session does not reorder its own edits.
+fn merge_backfill_edits(prior: Vec<Edit>, new: Vec<Edit>) -> Vec<Edit> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<(String, u32, String, u32, u32)> =
+        HashSet::with_capacity(prior.len() + new.len());
+    let mut out = Vec::with_capacity(prior.len() + new.len());
+    for e in prior.into_iter().chain(new) {
+        let key = (
+            e.conversation_id.clone(),
+            e.turn_index,
+            e.file.clone(),
+            e.line_range[0],
+            e.line_range[1],
+        );
+        if seen.insert(key) {
+            out.push(e);
+        }
+    }
+    out
 }
 
 // ============================================================
@@ -284,14 +528,19 @@ fn jsonl_files_in(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn confirm_or_bail(set: &TranscriptSet, yes: bool) -> anyhow::Result<()> {
+fn confirm_or_bail(set: &TranscriptSet, yes: bool, json: bool) -> anyhow::Result<()> {
     use std::io::{IsTerminal, Write};
 
-    println!(
-        "prov backfill: scanning {} transcript file(s) under {}",
-        set.files.len(),
-        set.source.display()
-    );
+    // Suppress the human-progress line in JSON mode so the only thing on
+    // stdout is the JSON envelope. Consumers who want the count can read it
+    // off the envelope's `scanned` field.
+    if !json {
+        println!(
+            "prov backfill: scanning {} transcript file(s) under {}",
+            set.files.len(),
+            set.source.display()
+        );
+    }
     if yes {
         return Ok(());
     }
@@ -362,7 +611,18 @@ fn load_candidate_commits(git: &Git) -> anyhow::Result<Vec<CommitMeta>> {
         if sha.is_empty() {
             continue;
         }
-        let added_by_file = collect_added_lines(git, &sha).unwrap_or_default();
+        // Surface the read failure so the user knows this commit can't match,
+        // rather than silently dropping it into "skipped_no_match" later.
+        let added_by_file = match collect_added_lines(git, &sha) {
+            Ok(map) => map,
+            Err(e) => {
+                eprintln!(
+                    "warning: could not read diff for {}: {e}; commit will be unmatchable",
+                    short_sha(&sha)
+                );
+                HashMap::new()
+            }
+        };
         out.push(CommitMeta {
             sha,
             author_email: email,
@@ -379,11 +639,14 @@ fn collect_added_lines(git: &Git, sha: &str) -> Result<HashMap<String, Vec<Added
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(0);
+    // `--` separates revs from any path arguments per
+    // docs/solutions/conventions/git-subprocess-hardening-conventions-2026-05-02.md
+    // — defensive even though we pass no paths today.
     let raw = if parent_count == 0 {
         let empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-        git.capture(["diff", "-U0", empty_tree, sha])?
+        git.capture(["diff", "-U0", empty_tree, sha, "--"])?
     } else {
-        git.capture(["diff", "-U0", &format!("{sha}~1..{sha}")])?
+        git.capture(["diff", "-U0", &format!("{sha}~1..{sha}"), "--"])?
     };
     Ok(parse_unified_diff_added(&raw))
 }
@@ -583,7 +846,18 @@ fn locate_file_in_diff<'a>(
 /// but a contiguous sub-run of unaltered lines is a strong-enough signal
 /// for backfill. Finer-grained matching is tracked as a v1.x follow-up.
 fn best_window(needle: &[String], added: &[AddedLine]) -> Option<([u32; 2], Vec<String>)> {
+    /// Defensive cap on input sizes. The triple-nested scan is O(N×M×min(N,M));
+    /// at 50k×50k inputs that's ~10^14 ops. A crafted transcript with a
+    /// 50k-line `Write` against a 50k-line commit diff would freeze backfill
+    /// for hours. The cap is set above any plausible legitimate session size
+    /// (Claude Code edits are bounded by tool-call payload limits) so a real
+    /// match still lands; pathological inputs surface as a no-match skip.
+    const MAX_LINES: usize = 8_192;
+
     if needle.is_empty() || added.is_empty() {
+        return None;
+    }
+    if needle.len() > MAX_LINES || added.len() > MAX_LINES {
         return None;
     }
     let added_hashes: Vec<&str> = added.iter().map(|a| a.hash.as_str()).collect();
@@ -641,54 +915,59 @@ fn parse_iso_unix(s: &str) -> Option<i64> {
     Some(civil_to_epoch(year, month, day, hour, minute, second))
 }
 
-#[allow(clippy::similar_names)]
-fn civil_to_epoch(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> i64 {
-    // Howard Hinnant's days_from_civil. Mirrors the reverse direction in
-    // prov_core::time but unfortunately not exposed there — keep this local.
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    days * 86_400 + hour * 3600 + minute * 60 + second
-}
-
 // ============================================================
 // Note construction
 // ============================================================
 
+/// Build the `Edit` list for this session's match, partitioned by privacy:
+/// returns `(public_edits, private_edits)`. The public/private split is keyed
+/// on the originating turn's *raw* prompt (`# prov:private` magic phrase
+/// detected before redaction), so a turn that opts out keeps its edits off the
+/// pushable ref even when the redactor leaves the prompt body intact.
 fn build_note_edits(
     session: &ParsedSession,
     matched: &SessionMatch<'_>,
     transcript_path: &Path,
     redactor: &Redactor,
-) -> Vec<Edit> {
-    // Cache redacted prompts keyed by turn_index so the same prompt isn't
-    // redacted N times for an N-edit turn.
-    let mut redacted_prompts: HashMap<u32, String> = HashMap::new();
-    let mut prompt_for = |turn_index: u32| -> String {
-        if let Some(s) = redacted_prompts.get(&turn_index) {
-            return s.clone();
-        }
-        let raw = session
-            .turns
-            .iter()
-            .find(|t| t.turn_index == turn_index)
-            .map(|t| t.prompt.clone())
-            .unwrap_or_default();
-        let red = redactor.redact(&raw).text;
-        redacted_prompts.insert(turn_index, red.clone());
-        red
-    };
+) -> (Vec<Edit>, Vec<Edit>) {
+    // Cache the redacted prompt + privacy flag per turn so we don't redact the
+    // same prompt N times for an N-edit turn, and so the privacy verdict
+    // computed once on the raw text drives every edit derived from it.
+    struct TurnView {
+        prompt: String,
+        private: bool,
+    }
+    let mut turn_cache: HashMap<u32, TurnView> = HashMap::new();
+    for idx in matched.per_edit.keys() {
+        let turn_index = session.edits[*idx].turn_index;
+        turn_cache.entry(turn_index).or_insert_with(|| {
+            let raw = session
+                .turns
+                .iter()
+                .find(|t| t.turn_index == turn_index)
+                .map(|t| t.prompt.clone())
+                .unwrap_or_default();
+            let private = is_prov_private(&raw);
+            let prompt = redactor.redact(&raw).text;
+            TurnView { prompt, private }
+        });
+    }
 
-    let transcript_str = transcript_path.to_string_lossy().to_string();
+    // Store only the basename. The full host path leaks the username and
+    // home-dir layout to anyone who reads the public notes ref (or fetches
+    // it on push-enabled remotes). Cross-machine lookups via the absolute
+    // path were never going to work anyway.
+    let transcript_str = transcript_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let confidence = matched.confidence;
 
-    let mut out = Vec::new();
+    let mut public_out = Vec::new();
+    let mut private_out = Vec::new();
     for (idx, m) in &matched.per_edit {
         let parsed: &ParsedEdit = &session.edits[*idx];
-        let prompt = prompt_for(parsed.turn_index);
+        let view = turn_cache.get(&parsed.turn_index).expect("populated above");
         let model = parsed
             .model
             .clone()
@@ -699,12 +978,12 @@ fn build_note_edits(
             .clone()
             .or_else(|| session.started_at.clone())
             .unwrap_or_default();
-        out.push(Edit {
+        let edit = Edit {
             file: m.file.clone(),
             line_range: m.line_range,
             content_hashes: m.content_hashes.clone(),
             original_blob_sha: None,
-            prompt,
+            prompt: view.prompt.clone(),
             conversation_id: session.session_id.clone(),
             turn_index: parsed.turn_index,
             tool_use_id: parsed.tool_use_id.clone(),
@@ -716,9 +995,14 @@ fn build_note_edits(
                 confidence,
                 transcript_path: transcript_str.clone(),
             }),
-        });
+        };
+        if view.private {
+            private_out.push(edit);
+        } else {
+            public_out.push(edit);
+        }
     }
-    out
+    (public_out, private_out)
 }
 
 /// True when every edit in the existing note carries a `Backfill` derivation.
@@ -738,19 +1022,50 @@ fn update_cache(cache_path: &Path, store: &NotesStore, sha: &str, note: &Note) {
     if !cache_path.exists() {
         return;
     }
-    let Ok(mut cache) = Cache::open(cache_path) else {
-        return;
+    let mut cache = match Cache::open(cache_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "warning: failed to open SQLite cache at {} for {}: {e}; run `prov reindex` to recover",
+                cache_path.display(),
+                short_sha(sha)
+            );
+            return;
+        }
     };
-    let new_ref_sha = store.ref_sha().ok().flatten();
-    let _ = cache.upsert_note(sha, note, new_ref_sha.as_deref());
+    // Distinguish a transient `git rev-parse` error from "ref absent." The
+    // `.ok().flatten()` shape collapses both to None, which masks the error
+    // and corrupts the cache stamp on flaky reads. See
+    // docs/solutions/conventions/defensive-default-polarity-conventions-2026-05-03.md §1.
+    let new_ref_sha = match store.ref_sha() {
+        Ok(opt) => opt,
+        Err(e) => {
+            eprintln!(
+                "warning: could not read notes ref for {}: {e}; SQLite cache stamp may drift; run `prov reindex` to recover",
+                short_sha(sha)
+            );
+            return;
+        }
+    };
+    if let Err(e) = cache.upsert_note(sha, note, new_ref_sha.as_deref()) {
+        eprintln!(
+            "warning: failed to update SQLite cache for {}: {e}; run `prov reindex` to recover",
+            short_sha(sha)
+        );
+    }
 }
 
 fn short_sha(sha: &str) -> &str {
+    // Git SHAs are ASCII hex, so byte slicing is safe.
     &sha[..sha.len().min(8)]
 }
 
-fn short_session(s: &str) -> &str {
-    &s[..s.len().min(8)]
+/// Truncate a session id to the first 8 USV characters for display. session_id
+/// is parsed straight from transcript JSON without validation, so byte-slicing
+/// would panic on a multi-byte codepoint at byte 8; collect the first 8 chars
+/// instead.
+fn short_session(s: &str) -> String {
+    s.chars().take(8).collect()
 }
 
 #[cfg(test)]

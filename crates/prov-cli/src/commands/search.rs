@@ -4,10 +4,13 @@
 //! a human-readable rendering and a `--json` envelope for the Skill and other
 //! consumers.
 
+use std::collections::HashMap;
+
 use clap::Parser;
 use serde::Serialize;
 
-use prov_core::storage::sqlite::EditRow;
+use prov_core::schema::{DerivedFrom, Note};
+use prov_core::storage::sqlite::{Cache, EditRow};
 
 use super::common::RepoHandles;
 
@@ -40,11 +43,22 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         hits.truncate(limit_usize);
     }
 
+    // Pull derived_from per hit out of the cache's notes table so backfilled
+    // matches surface with the (approximate) marker. Live captures pre-U15
+    // never set derived_from so their hits look unchanged. Cache misses
+    // degrade gracefully — an unmatched hit just reports as live, matching
+    // pre-fix behavior. Per-commit lookup keeps this O(unique_commits) rather
+    // than O(hits).
+    let derivations = lookup_derivations(&handles.cache, &hits);
+
     if args.json {
         let total_matched = u32::try_from(hits.len()).unwrap_or(u32::MAX);
         let payload = SearchJson {
             query: args.query.clone(),
-            hits: hits.iter().map(SearchHitJson::from).collect(),
+            hits: hits
+                .iter()
+                .map(|h| SearchHitJson::from_row(h, derivations.get(&derivation_key(h))))
+                .collect(),
             total_matched,
             limit: args.limit,
             truncated,
@@ -56,8 +70,16 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     } else {
         println!("{} match(es) for {:?}:", hits.len(), args.query);
         for h in &hits {
+            let approx = if matches!(
+                derivations.get(&derivation_key(h)),
+                Some(DerivedFrom::Backfill { .. })
+            ) {
+                "  (approximate)"
+            } else {
+                ""
+            };
             println!(
-                "  {}  {}  L{}-{}  {}",
+                "  {}  {}  L{}-{}  {}{approx}",
                 short_sha(&h.commit_sha),
                 h.timestamp,
                 h.line_start,
@@ -74,6 +96,33 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Stable lookup key for `derivations` map: every hit corresponds to one
+/// `(commit_sha, edit_idx)` pair in the source note.
+fn derivation_key(row: &EditRow) -> (String, u32) {
+    (row.commit_sha.clone(), row.edit_idx)
+}
+
+/// Read the source note for each unique commit in `hits` and build a map of
+/// (commit_sha, edit_idx) → derived_from. Cache-miss or schema errors silently
+/// skip — the hit still surfaces, just without the approximate marker.
+fn lookup_derivations(cache: &Cache, hits: &[EditRow]) -> HashMap<(String, u32), DerivedFrom> {
+    let mut out: HashMap<(String, u32), DerivedFrom> = HashMap::new();
+    let mut seen_commits: HashMap<String, Option<Note>> = HashMap::new();
+    for h in hits {
+        let note = seen_commits
+            .entry(h.commit_sha.clone())
+            .or_insert_with(|| cache.get_note(&h.commit_sha).ok().flatten());
+        let Some(note) = note.as_ref() else { continue };
+        let Some(edit) = note.edits.get(h.edit_idx as usize) else {
+            continue;
+        };
+        if let Some(d) = edit.derived_from.clone() {
+            out.insert((h.commit_sha.clone(), h.edit_idx), d);
+        }
+    }
+    out
 }
 
 /// Wrap the user-supplied query in an FTS5 phrase quote so input that contains
@@ -113,10 +162,20 @@ struct SearchHitJson {
     model: String,
     timestamp: String,
     conversation_id: String,
+    /// True when the originating note was reconstructed by `prov backfill`.
+    /// Consumers must surface an "approximate" disclaimer; treating a
+    /// backfilled prompt as authoritative violates R14.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    approximate: bool,
+    /// Backfill match confidence in `[0.0, 1.0]`, only emitted when
+    /// `approximate` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approximate_confidence: Option<f32>,
 }
 
-impl From<&EditRow> for SearchHitJson {
-    fn from(row: &EditRow) -> Self {
+impl SearchHitJson {
+    fn from_row(row: &EditRow, derived: Option<&DerivedFrom>) -> Self {
+        let (approximate, approximate_confidence) = DerivedFrom::approximate_fields(derived);
         Self {
             commit_sha: row.commit_sha.clone(),
             file: row.file.clone(),
@@ -126,6 +185,8 @@ impl From<&EditRow> for SearchHitJson {
             model: row.model.clone(),
             timestamp: row.timestamp.clone(),
             conversation_id: row.conversation_id.clone(),
+            approximate,
+            approximate_confidence,
         }
     }
 }
