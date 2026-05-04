@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "edits": [
+    {
+      "file": "crates/prov-core/src/schema.rs",
+      "line_range": [
+        9,
+        14
+      ],
+      "content_hashes": [
+        "b383767ac696c81850b0cb8b93013f6fc941859fbe9b2e11f91e49a49e3146c5",
+        "6d29f50adaf617ffdbf245524184ab63d5a2d4114dbda548f3054d41eb5da5c3",
+        "057cc128b12a53708df5dad9dc625e1c81ae8347844e65f32ccaffd72d97041d",
+        "1e20f462e7280ded6d90ac710a224f40db3575eeb2f1cd853a86e019f76ffc03",
+        "c4f735ed511c389751be28ab5f5cd076d3063aa29fb6e3f7f0dadbcd55f53b11",
+        "5ca2224efda934339d8b2fe5f968727f4c0a31cca1f89b6787d997977fbd335b"
+      ],
+      "prompt": "close the PR and drop U14",
+      "conversation_id": "1f425b3a-65cb-40e3-914a-7104f36a5008",
+      "turn_index": 5,
+      "tool_use_id": "toolu_01K9Z8vub6rnDzrb8XzirvHj",
+      "model": "claude-opus-4-7[1m]",
+      "tool": "claude-code",
+      "timestamp": "2026-05-04T12:34:26Z"
+    },
+    {
+      "file": "crates/prov-core/src/schema.rs",
+      "line_range": [
+        81,
+        85
+      ],
+      "content_hashes": [
+        "33dc1b6d5f82fa57e7097037da2ed358cf65e27311bee60df708a95e9291377e",
+        "910cc59584c2a182b4734ec662b50f297e246398ee189dc9cace004300138af9",
+        "964c66004d3aba336db541ee98fdff71be6f23dc7830a275724801fde48cbc75",
+        "247558936cb50e5228184a541f56b8278cd694b89137bbd7a30f0426aa74d219",
+        "d9ced36c3863b4985b624316fec00dfdbbf2b7340e44aa3b4a13805d97d27953"
+      ],
+      "prompt": "close the PR and drop U14",
+      "conversation_id": "1f425b3a-65cb-40e3-914a-7104f36a5008",
+      "turn_index": 5,
+      "tool_use_id": "toolu_01XyBmLK7fkuGDcgb2qQqLV2",
+      "model": "claude-opus-4-7[1m]",
+      "tool": "claude-code",
+      "timestamp": "2026-05-04T12:34:33Z"
+    },
+    {
+      "file": "crates/prov-core/src/resolver.rs",
+      "line_range": [
+        218,
+        220
+      ],
+      "content_hashes": [
+        "7aa2a01eaec935801551f6d089fa1b1887fb1eadc2a6bccb2129a15e2f49f758",
+        "ca0679546ad384d0e803644439f61ae80d9c74ba3484b2c8ec25e9f6c5b5ad2a",
+        "7543e7a1a690aa0ef16d8962526b70bf3f9fbefa6ca0e9c5fc6a738a31b04cee"
+      ],
+      "prompt": "close the PR and drop U14",
+      "conversation_id": "1f425b3a-65cb-40e3-914a-7104f36a5008",
+      "turn_index": 5,
+      "tool_use_id": "toolu_01NoCqDJxeZhmWQWDDCLzqjW",
+      "model": "claude-opus-4-7[1m]",
+      "tool": "claude-code",
+      "timestamp": "2026-05-04T12:34:37Z"
+    },
+    {
+      "file": "docs/plans/2026-04-28-001-feat-prompt-provenance-v1-plan.md",
+      "line_range": [
+        1044,
+        1044
+      ],
+      "content_hashes": [
+        "d103e9d42baa655b79cc972473ae61b6cecc52fcfdb014382c591782de02ec1e"
+      ],
+      "prompt": "close the PR and drop U14",
+      "conversation_id": "1f425b3a-65cb-40e3-914a-7104f36a5008",
+      "turn_index": 5,
+      "tool_use_id": "toolu_01CsaPYWNaSxAktZs3PW9jWy",
+      "model": "claude-opus-4-7[1m]",
+      "tool": "claude-code",
+      "timestamp": "2026-05-04T12:35:30Z"
+    },
+    {
+      "file": "docs/plans/2026-04-28-001-feat-prompt-provenance-v1-plan.md",
+      "line_range": [
+        383,
+        383
+      ],
+      "content_hashes": [
+        "55d62b5c77daf361ce617d8c084ab2f69dee3776cdd8add1e02693becd8460cf"
+      ],
+      "prompt": "close the PR and drop U14",
+      "conversation_id": "1f425b3a-65cb-40e3-914a-7104f36a5008",
+      "turn_index": 5,
+      "tool_use_id": "toolu_01DQ78cZqUekmEJbh7dLKtEJ",
+      "model": "claude-opus-4-7[1m]",
+      "tool": "claude-code",
+      "timestamp": "2026-05-04T12:36:03Z"
+    },
+    {
+      "file": "docs/plans/2026-04-28-001-feat-prompt-provenance-v1-plan.md",
+      "line_range": [
+        858,
+        858
+      ],
+      "content_hashes": [
+        "9b2105fef3b1c101ef7a2cf3ca8a5b45e0c8490fb888a1c57a134e101f86bd27"
+      ],
+      "prompt": "close the PR and drop U14",
+      "conversation_id": "1f425b3a-65cb-40e3-914a-7104f36a5008",
+      "turn_index": 5,
+      "tool_use_id": "toolu_01DeMCfRme2bV36HDNwRcbHb",
+      "model": "claude-opus-4-7[1m]",
+      "tool": "claude-code",
+      "timestamp": "2026-05-04T12:36:08Z"
+    },
+    {
+      "file": "docs/plans/2026-04-28-001-feat-prompt-provenance-v1-plan.md",
+      "line_range": [
+        161,
+        161
+      ],
+      "content_hashes": [
+        "1297e9796a11a4230711a9e08a8d79374daddc94f36925b1fd63d97169b217a2"
+      ],
+      "prompt": "close the PR and drop U14",
+      "conversation_id": "1f425b3a-65cb-40e3-914a-7104f36a5008",
+      "turn_index": 5,
+      "tool_use_id": "toolu_01Szje7nQGKpf9GzW1Zfrxx8",
+      "model": "claude-opus-4-7[1m]",
+      "tool": "claude-code",
+      "timestamp": "2026-05-04T12:36:28Z"
+    }
+  ]
+}
