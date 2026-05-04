@@ -12,6 +12,7 @@ pub mod schema;
 pub mod session;
 pub mod storage;
 pub mod time;
+pub mod transcript;
 
 pub use resolver::{NoProvenanceReason, ResolveResult, Resolver, ResolverError};
 pub use schema::SCHEMA_VERSION;
