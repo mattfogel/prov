@@ -117,6 +117,7 @@ fn whole_file_lookup(
 ) -> anyhow::Result<()> {
     let file_str = file.to_string_lossy().to_string();
     let edits = handles.cache.edits_for_file(&file_str)?;
+    let derivations = lookup_derivations(&handles, &edits);
 
     let history = if args.history {
         load_history_chain(&handles, &edits)?
@@ -127,15 +128,43 @@ fn whole_file_lookup(
     if args.json {
         let payload = WholeFileJson {
             file: file_str.clone(),
-            edits: edits.iter().map(EditJson::from_row).collect(),
+            edits: edits
+                .iter()
+                .zip(derivations.iter())
+                .map(|(row, derived)| EditJson::from_row(row, derived.as_ref()))
+                .collect(),
             history: history.iter().map(EditJson::from_history).collect(),
             prov_version: env!("CARGO_PKG_VERSION"),
         };
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        render_whole_file_text(&file_str, &edits, &history, args.full);
+        render_whole_file_text(&file_str, &edits, &derivations, &history, args.full);
     }
     Ok(())
+}
+
+/// Look up the `derived_from` field of each cached edit. Returns the same
+/// length and order as `edits` so callers can zip the two together when
+/// rendering. A cache miss or a missing edit index yields `None`, which
+/// downstream renders treat the same as live capture.
+fn lookup_derivations(
+    handles: &RepoHandles,
+    edits: &[prov_core::storage::sqlite::EditRow],
+) -> Vec<Option<DerivedFrom>> {
+    let mut out = Vec::with_capacity(edits.len());
+    let mut note_cache: std::collections::HashMap<String, Option<prov_core::schema::Note>> =
+        std::collections::HashMap::new();
+    for row in edits {
+        let entry = note_cache
+            .entry(row.commit_sha.clone())
+            .or_insert_with(|| handles.cache.get_note(&row.commit_sha).ok().flatten());
+        let derived = entry
+            .as_ref()
+            .and_then(|n| n.edits.get(row.edit_idx as usize))
+            .and_then(|e| e.derived_from.clone());
+        out.push(derived);
+    }
+    out
 }
 
 /// Walk every edit's `derived_from` chain into a flat list of superseded prior edits.
@@ -231,6 +260,7 @@ fn render_point_text(result: &ResolveResult, file: &std::path::Path, line: u32, 
             conversation_id,
             turn_index,
             blame_commit,
+            derived_from,
             ..
         } => {
             println!("{}:{line}", file.display());
@@ -240,6 +270,9 @@ fn render_point_text(result: &ResolveResult, file: &std::path::Path, line: u32, 
             println!("  captured:  {timestamp}");
             println!("  session:   {conversation_id} (turn {turn_index})");
             println!("  commit:    {blame_commit}");
+            if let Some(approx) = approximate_label(derived_from.as_ref()) {
+                println!("  source:    {approx}");
+            }
             if full {
                 println!();
                 println!("  --full: transcript expansion is not yet shipped (v1.x); the");
@@ -255,6 +288,7 @@ fn render_point_text(result: &ResolveResult, file: &std::path::Path, line: u32, 
             turn_index,
             blame_author_after,
             blame_commit,
+            derived_from,
             ..
         } => {
             println!("{}:{line}", file.display());
@@ -265,6 +299,9 @@ fn render_point_text(result: &ResolveResult, file: &std::path::Path, line: u32, 
             println!("  session:   {conversation_id} (turn {turn_index})");
             println!("  commit:    {blame_commit}");
             println!("  drifted_by: {blame_author_after}");
+            if let Some(approx) = approximate_label(derived_from.as_ref()) {
+                println!("  source:    {approx}");
+            }
             if full {
                 println!();
                 println!("  --full: transcript expansion is not yet shipped (v1.x).");
@@ -280,6 +317,18 @@ fn render_point_text(result: &ResolveResult, file: &std::path::Path, line: u32, 
     }
 }
 
+/// Render a `Backfill` derivation as a human-readable label. Returns `None`
+/// for live-captured or `Rewrite`-derived edits — those are authoritative and
+/// don't need an annotation.
+fn approximate_label(derived: Option<&DerivedFrom>) -> Option<String> {
+    match derived? {
+        DerivedFrom::Backfill { confidence, .. } => Some(format!(
+            "(approximate) reconstructed by `prov backfill` (confidence {confidence:.2})"
+        )),
+        _ => None,
+    }
+}
+
 fn describe_reason(r: &NoProvenanceReason) -> &'static str {
     match r {
         NoProvenanceReason::NoBlame => "git blame produced no attribution",
@@ -292,6 +341,7 @@ fn describe_reason(r: &NoProvenanceReason) -> &'static str {
 fn render_whole_file_text(
     file: &str,
     edits: &[prov_core::storage::sqlite::EditRow],
+    derivations: &[Option<DerivedFrom>],
     history: &[HistoryEntry],
     full: bool,
 ) {
@@ -300,9 +350,14 @@ fn render_whole_file_text(
         return;
     }
     println!("{file} — {} captured edit(s)", edits.len());
-    for e in edits {
+    for (e, derived) in edits.iter().zip(derivations.iter()) {
+        let approx = if matches!(derived, Some(DerivedFrom::Backfill { .. })) {
+            "  (approximate)"
+        } else {
+            ""
+        };
         println!(
-            "  L{}-{}  {}  {}  {}",
+            "  L{}-{}  {}  {}  {}{approx}",
             e.line_start,
             e.line_end,
             e.timestamp,
@@ -358,6 +413,15 @@ struct PointJson {
     blame_author_after: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     no_provenance_reason: Option<String>,
+    /// True when the prompt was reconstructed by `prov backfill` rather than
+    /// captured live; consumers (Skill, Action) should surface an "approximate"
+    /// disclaimer when set.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    approximate: bool,
+    /// Backfill match confidence in `[0.0, 1.0]`. Only emitted when
+    /// `approximate` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approximate_confidence: Option<f32>,
     /// Prov version that emitted this envelope (for downstream version pinning).
     prov_version: &'static str,
 }
@@ -374,21 +438,28 @@ impl PointJson {
                 conversation_id,
                 turn_index,
                 blame_commit,
+                derived_from,
                 ..
-            } => Self {
-                file,
-                line,
-                status: "unchanged",
-                prompt: Some(prompt.clone()),
-                model: Some(model.clone()),
-                timestamp: Some(timestamp.clone()),
-                conversation_id: Some(conversation_id.clone()),
-                turn_index: Some(*turn_index),
-                blame_commit: Some(blame_commit.clone()),
-                blame_author_after: None,
-                no_provenance_reason: None,
-                prov_version: env!("CARGO_PKG_VERSION"),
-            },
+            } => {
+                let (approximate, approximate_confidence) =
+                    DerivedFrom::approximate_fields(derived_from.as_ref());
+                Self {
+                    file,
+                    line,
+                    status: "unchanged",
+                    prompt: Some(prompt.clone()),
+                    model: Some(model.clone()),
+                    timestamp: Some(timestamp.clone()),
+                    conversation_id: Some(conversation_id.clone()),
+                    turn_index: Some(*turn_index),
+                    blame_commit: Some(blame_commit.clone()),
+                    blame_author_after: None,
+                    no_provenance_reason: None,
+                    approximate,
+                    approximate_confidence,
+                    prov_version: env!("CARGO_PKG_VERSION"),
+                }
+            }
             ResolveResult::Drifted {
                 prompt,
                 model,
@@ -397,21 +468,28 @@ impl PointJson {
                 turn_index,
                 blame_author_after,
                 blame_commit,
+                derived_from,
                 ..
-            } => Self {
-                file,
-                line,
-                status: "drifted",
-                prompt: Some(prompt.clone()),
-                model: Some(model.clone()),
-                timestamp: Some(timestamp.clone()),
-                conversation_id: Some(conversation_id.clone()),
-                turn_index: Some(*turn_index),
-                blame_commit: Some(blame_commit.clone()),
-                blame_author_after: Some(blame_author_after.clone()),
-                no_provenance_reason: None,
-                prov_version: env!("CARGO_PKG_VERSION"),
-            },
+            } => {
+                let (approximate, approximate_confidence) =
+                    DerivedFrom::approximate_fields(derived_from.as_ref());
+                Self {
+                    file,
+                    line,
+                    status: "drifted",
+                    prompt: Some(prompt.clone()),
+                    model: Some(model.clone()),
+                    timestamp: Some(timestamp.clone()),
+                    conversation_id: Some(conversation_id.clone()),
+                    turn_index: Some(*turn_index),
+                    blame_commit: Some(blame_commit.clone()),
+                    blame_author_after: Some(blame_author_after.clone()),
+                    no_provenance_reason: None,
+                    approximate,
+                    approximate_confidence,
+                    prov_version: env!("CARGO_PKG_VERSION"),
+                }
+            }
             ResolveResult::NoProvenance { reason } => Self {
                 file,
                 line,
@@ -424,6 +502,8 @@ impl PointJson {
                 blame_commit: None,
                 blame_author_after: None,
                 no_provenance_reason: Some(describe_reason(reason).into()),
+                approximate: false,
+                approximate_confidence: None,
                 prov_version: env!("CARGO_PKG_VERSION"),
             },
         }
@@ -448,10 +528,17 @@ struct EditJson {
     model: String,
     timestamp: String,
     conversation_id: String,
+    /// True when this edit was reconstructed by `prov backfill`. Consumers
+    /// should annotate such entries as approximate.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    approximate: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approximate_confidence: Option<f32>,
 }
 
 impl EditJson {
-    fn from_row(row: &prov_core::storage::sqlite::EditRow) -> Self {
+    fn from_row(row: &prov_core::storage::sqlite::EditRow, derived: Option<&DerivedFrom>) -> Self {
+        let (approximate, approximate_confidence) = DerivedFrom::approximate_fields(derived);
         Self {
             commit_sha: row.commit_sha.clone(),
             line_start: row.line_start,
@@ -460,10 +547,14 @@ impl EditJson {
             model: row.model.clone(),
             timestamp: row.timestamp.clone(),
             conversation_id: row.conversation_id.clone(),
+            approximate,
+            approximate_confidence,
         }
     }
 
     fn from_history(h: &HistoryEntry) -> Self {
+        let (approximate, approximate_confidence) =
+            DerivedFrom::approximate_fields(h.edit.derived_from.as_ref());
         Self {
             commit_sha: h.commit_sha.clone(),
             line_start: h.edit.line_range[0],
@@ -472,6 +563,8 @@ impl EditJson {
             model: h.edit.model.clone(),
             timestamp: h.edit.timestamp.clone(),
             conversation_id: h.edit.conversation_id.clone(),
+            approximate,
+            approximate_confidence,
         }
     }
 }

@@ -110,6 +110,121 @@ with a commit/PR link).
 
 ---
 
+## U15 — `prov backfill` (PR #45)
+
+These items surfaced in the multi-agent code review of PR #45 but were
+deferred from the in-PR fix pass — either because they're system-wide
+shapes that bleed past U15's scope (`.provignore` loading, the Skill
+docs gap), or because they're lower-impact polish that warrants its
+own focused PR rather than bloating the safety-fix commit.
+
+- [ ] **No locking on concurrent `prov backfill` runs.** Two simultaneous
+  invocations both call `git notes add --force`; last writer wins, the
+  earlier run's note silently disappears. Reproducible by running two
+  `--yes` invocations against overlapping transcript sets in the same
+  repo. Fix sketch: take an advisory file lock on
+  `<git-dir>/prov-backfill.lock` for the duration of the candidate
+  walk + write loop; refuse to start (or wait) when held. Owner: open;
+  pickup when team-mode users actually report drift.
+
+- [ ] **`confirm_or_bail` hangs in CI pseudo-TTY.** When `--yes` is
+  omitted and stdin is a pty (some CI runners present one), the
+  current code calls `is_terminal()` and gets `true`, then
+  `read_line()` blocks indefinitely. Fix: add a read timeout via
+  `crossterm` or a poll-based read, or hard-fail when no `--yes` and
+  stdin is non-interactive after a brief grace. Verification: run
+  `script -q -c 'prov backfill' /dev/null` (which fakes a pty) and
+  confirm it errors fast instead of hanging. Owner: open.
+
+- [ ] **Re-running backfill creates unreachable note objects each
+  pass.** `process_transcript` re-writes the merged note even when the
+  resulting JSON is byte-identical to the prior write. Each rewrite
+  advances the notes ref and orphans the prior blob; `prov gc` cleans
+  it up later but the churn is wasteful. Fix sketch: hash the new
+  serialized note JSON and compare against the prior; skip the write
+  when identical. Owner: open; visible in long-running team usage.
+
+- [ ] **`--transcript-path` doesn't validate cwd against current
+  repo.** A transcript whose `cwd` field references a different repo
+  is silently processed against the current repo's commit history,
+  producing cross-repo provenance pollution. Fix: at parse time,
+  check `session.cwd` against `git.work_tree()` (after canonicalizing
+  both); refuse with a clear error when they diverge. The
+  `--cross-author` flag is the natural opt-out shape for users who
+  want to backfill from a different machine's transcripts. Owner:
+  open; revisit if a real user surfaces a legitimate cross-repo
+  workflow.
+
+- [ ] **Schema drift in transcript `tool_use` field names → silent
+  empty sessions.** When Claude Code renames a field in
+  `decompose_tool_use`, the parser returns an empty edits vec, the
+  session has no edits, and the run-summary says "N sessions without
+  a match" — indistinguishable from "no content overlap." Fix sketch:
+  emit an explicit warning when a transcript parses cleanly but
+  produces zero edits AND the parser hit at least one unrecognized
+  `tool_use.name`; surface those names in the warning so a follow-up
+  fix has a concrete target. Owner: open; the canary fires the first
+  time Claude Code ships an incompatible schema.
+
+- [ ] **`.provignore` is never loaded anywhere.** System-wide finding
+  surfaced by U15's adversarial reviewer: live capture
+  (`hook.rs::user-prompt-submit`), the pre-push gate, AND backfill
+  all use `Redactor::new()` with built-in detectors only — none load
+  `.provignore`. The plan's R4 calls out per-project regex rules as a
+  v1 capability but the wiring is missing. Backfill amplifies this
+  into a mass-secret-leak shape if a team has been depending on
+  `.provignore` for project-specific patterns. Fix: add
+  `Redactor::with_provignore(repo_root)` and call it from all three
+  surfaces; add a regression test that verifies a `.provignore`
+  pattern redacts in each. Owner: blocking before any push-by-default
+  posture is restored.
+
+- [ ] **Skill silent on `prov backfill` and approximate-note
+  weighting.** `plugin/skills/prov/SKILL.md` teaches `prov log` only.
+  An agent asked "bootstrap provenance for this repo" has no
+  documented path to `prov backfill --yes`, and the `(approximate)`
+  marker that backfill stamps onto reconstructed notes is in the JSON
+  envelope but the Skill doesn't tell the agent to weight approximate
+  notes lower than live captures. Fix: add a bootstrapping section
+  documenting `--yes` (required in agent context, since stdin is
+  never a TTY) and an "interpreting backfilled notes" section in
+  `references/querying.md` with a JSON example showing
+  `"approximate": true` and `"approximate_confidence": 0.83`. Owner:
+  pickup with whoever next touches the Skill.
+
+- [ ] **`MAX_COMMITS=5_000` cap silently drops older commits.**
+  `load_candidate_commits` walks at most 5000 commits with no warning
+  when the repo is larger. Older matching commits surface as
+  `skipped_no_match` — indistinguishable from a session with no real
+  candidate. Fix: when `git rev-list --count HEAD > MAX_COMMITS`,
+  warn at run start naming the cap and exposing a `--max-commits`
+  override. Owner: open.
+
+- [ ] **`parse_unified_diff_added` confuses content lines starting
+  with `++ b/` as file headers.** Unified diff prepends `+` to every
+  added line; a source line whose text is verbatim `++ b/foo` becomes
+  `+++ b/foo` in the diff and is consumed by `strip_prefix("+++ b/")`.
+  The parser switches `current_file` to a bogus path, drops added
+  lines, and corrupts the per-file map until the next real `+++ b/`.
+  Real-world hits are uncommon (markdown / commented diffs) but
+  possible. Fix: gate `+++ b/` interpretation on having just seen
+  `--- a/` on the prior line, or use `git diff --raw -z` boundaries.
+  Owner: open.
+
+- [ ] **`locate_file_in_diff` non-deterministic on ambiguous suffix
+  matches.** When two diff keys are both suffixes of the captured
+  absolute path (e.g., `src/main.rs` and `lib/main.rs` both in one
+  commit, captured path ends with `main.rs`), the function returns
+  whichever HashMap iteration visits first — meaning re-running
+  backfill against the same transcripts can produce different
+  attribution and break idempotency. Fix: collect every suffix-
+  matching key, return the one with the longest common-suffix length
+  (most specific). Verification: add a test with two candidate keys
+  that are both suffixes of the captured path and assert the longer
+  key wins. Owner: open.
+
+---
+
 ## docs/solutions — refresh hints
 
 - [ ] **Refresh `git-subprocess-hardening-conventions-2026-05-02.md` Pattern 7

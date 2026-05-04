@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use prov_core::schema::DerivedFrom;
 use serde::Serialize;
 
 /// HTML marker the GitHub Action uses to upsert the comment in place.
@@ -63,6 +64,15 @@ pub struct Turn {
     pub files: Vec<TurnFileLines>,
     /// True when none of this turn's lines survive into the head diff.
     pub superseded: bool,
+    /// True when the originating note was reconstructed by `prov backfill`
+    /// rather than captured live. Renders as `(approximate)` in Markdown so a
+    /// reviewer never confuses a fuzzy-matched prompt for a verbatim capture.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub approximate: bool,
+    /// Backfill match confidence in `[0.0, 1.0]`. Only emitted when
+    /// `approximate` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approximate_confidence: Option<f32>,
 }
 
 /// Per-file line count for a turn.
@@ -208,10 +218,18 @@ impl Session {
 impl Turn {
     fn append_markdown(&self, s: &mut String, ordinal: u32) {
         let prompt = quote_prompt(&self.prompt);
+        let approx_suffix = if self.approximate {
+            self.approximate_confidence.map_or_else(
+                || " _(approximate — backfilled)_".to_string(),
+                |c| format!(" _(approximate — backfilled, confidence {c:.2})_"),
+            )
+        } else {
+            String::new()
+        };
         if self.superseded {
             writeln!(
                 s,
-                "{ordinal}. ~~{prompt}~~ _(superseded — final code does not contain this turn's output)_"
+                "{ordinal}. ~~{prompt}~~ _(superseded — final code does not contain this turn's output)_{approx_suffix}"
             )
             .unwrap();
             return;
@@ -223,9 +241,9 @@ impl Turn {
             .collect::<Vec<_>>()
             .join(", ");
         if files.is_empty() {
-            writeln!(s, "{ordinal}. **{prompt}**").unwrap();
+            writeln!(s, "{ordinal}. **{prompt}**{approx_suffix}").unwrap();
         } else {
-            writeln!(s, "{ordinal}. **{prompt}** — _{files}_").unwrap();
+            writeln!(s, "{ordinal}. **{prompt}** — _{files}_{approx_suffix}").unwrap();
         }
     }
 }
@@ -271,6 +289,12 @@ struct TurnAccumulator {
     timestamp: String,
     /// File → line count that survived into the diff.
     file_lines: BTreeMap<String, u32>,
+    /// True when at least one contributing line came from a backfilled note.
+    /// We track per-turn rather than per-line so a turn whose lines split
+    /// across live + backfilled sources surfaces with the disclaimer (the
+    /// stricter signal).
+    approximate: bool,
+    approximate_confidence: Option<f32>,
 }
 
 impl TimelineBuilder {
@@ -300,6 +324,7 @@ impl TimelineBuilder {
         if info.timestamp < session.earliest_ts.as_str() {
             session.earliest_ts = info.timestamp.to_string();
         }
+        let (approximate, approx_conf) = DerivedFrom::approximate_fields(info.derived_from);
         let turn = session
             .turns
             .entry(info.turn_index)
@@ -308,8 +333,20 @@ impl TimelineBuilder {
                 prompt: info.prompt.to_string(),
                 timestamp: info.timestamp.to_string(),
                 file_lines: BTreeMap::new(),
+                approximate: false,
+                approximate_confidence: None,
             });
         *turn.file_lines.entry(info.file.to_string()).or_insert(0) += 1;
+        // Sticky approximate: if any contributing line is backfilled, the
+        // whole turn renders with the disclaimer. Confidence is the lowest
+        // observed (the conservative signal).
+        if approximate {
+            turn.approximate = true;
+            turn.approximate_confidence = match (turn.approximate_confidence, approx_conf) {
+                (Some(prev), Some(new)) => Some(prev.min(new)),
+                (None, x) | (x, None) => x,
+            };
+        }
     }
 
     /// Record one turn that exists on a PR commit but does not survive into the
@@ -327,6 +364,7 @@ impl TimelineBuilder {
         if info.timestamp < session.earliest_ts.as_str() {
             session.earliest_ts = info.timestamp.to_string();
         }
+        let (approximate, approx_conf) = DerivedFrom::approximate_fields(info.derived_from);
         // Don't overwrite a surviving turn with a superseded marker.
         session
             .turns
@@ -336,6 +374,8 @@ impl TimelineBuilder {
                 prompt: info.prompt.to_string(),
                 timestamp: info.timestamp.to_string(),
                 file_lines: BTreeMap::new(),
+                approximate,
+                approximate_confidence: approx_conf,
             });
     }
 
@@ -372,6 +412,8 @@ impl TimelineBuilder {
                             timestamp: t.timestamp,
                             files,
                             superseded,
+                            approximate: t.approximate,
+                            approximate_confidence: t.approximate_confidence,
                         }
                     })
                     .collect();
@@ -412,6 +454,9 @@ pub struct TurnLineInfo<'a> {
     pub prompt: &'a str,
     pub model: &'a str,
     pub timestamp: &'a str,
+    /// Originating note's `derived_from` field. `Some(Backfill { .. })` flips
+    /// the turn into approximate mode in the rendered output.
+    pub derived_from: Option<&'a DerivedFrom>,
 }
 
 /// Borrowed view passed to [`TimelineBuilder::add_superseded_turn`].
@@ -421,6 +466,7 @@ pub struct SupersededTurnInfo<'a> {
     pub prompt: &'a str,
     pub model: &'a str,
     pub timestamp: &'a str,
+    pub derived_from: Option<&'a DerivedFrom>,
 }
 
 /// Collapse a per-file vec of line numbers into contiguous ranges.
@@ -491,6 +537,7 @@ mod tests {
                 prompt: "Add Stripe webhook handling",
                 model: "claude-opus-4-7",
                 timestamp: "2026-04-26T10:00:00Z",
+                derived_from: None,
             });
         }
         b.add_turn_line(&TurnLineInfo {
@@ -500,6 +547,7 @@ mod tests {
             prompt: "Use a 24h dedupe window",
             model: "claude-opus-4-7",
             timestamp: "2026-04-26T10:05:00Z",
+            derived_from: None,
         });
         let t = b.build();
         let md = t.to_markdown();
@@ -520,6 +568,7 @@ mod tests {
             prompt: "first prompt",
             model: "claude-haiku-4-5",
             timestamp: "2026-04-26T10:00:00Z",
+            derived_from: None,
         });
         b.add_superseded_turn(&SupersededTurnInfo {
             conversation_id: "sess_1",
@@ -527,6 +576,7 @@ mod tests {
             prompt: "Fix the type error",
             model: "claude-haiku-4-5",
             timestamp: "2026-04-26T10:05:00Z",
+            derived_from: None,
         });
         let t = b.build();
         let md = t.to_markdown();
@@ -544,6 +594,7 @@ mod tests {
             prompt: "later",
             model: "m",
             timestamp: "2026-04-27T10:00:00Z",
+            derived_from: None,
         });
         b.add_turn_line(&TurnLineInfo {
             file: "b.rs",
@@ -552,6 +603,7 @@ mod tests {
             prompt: "earlier",
             model: "m",
             timestamp: "2026-04-26T10:00:00Z",
+            derived_from: None,
         });
         let t = b.build();
         let md = t.to_markdown();
@@ -591,6 +643,54 @@ mod tests {
     }
 
     #[test]
+    fn backfilled_turn_renders_with_approximate_marker() {
+        // Regression for U15 review's correctness #003: a turn whose origin
+        // note is `derived_from: Backfill { confidence }` must surface the
+        // `(approximate)` disclaimer in the rendered Markdown so reviewers
+        // never confuse a fuzzy-match for a verbatim live capture.
+        let backfill = DerivedFrom::Backfill {
+            confidence: 0.83,
+            transcript_path: "x.jsonl".into(),
+        };
+        let mut b = TimelineBuilder::new("0.1.0");
+        b.add_turn_line(&TurnLineInfo {
+            file: "src/auth.ts",
+            conversation_id: "sess_back",
+            turn_index: 0,
+            prompt: "tighten the rate limiter",
+            model: "claude-sonnet-4-7",
+            timestamp: "2026-04-26T10:00:00Z",
+            derived_from: Some(&backfill),
+        });
+        let t = b.build();
+        assert!(t.sessions[0].turns[0].approximate);
+        let md = t.to_markdown();
+        assert!(
+            md.contains("(approximate — backfilled, confidence 0.83)"),
+            "expected approximate disclaimer in md: {md}",
+        );
+    }
+
+    #[test]
+    fn live_turn_does_not_render_approximate_marker() {
+        let mut b = TimelineBuilder::new("0.1.0");
+        b.add_turn_line(&TurnLineInfo {
+            file: "src/auth.ts",
+            conversation_id: "sess_live",
+            turn_index: 0,
+            prompt: "tighten the rate limiter",
+            model: "claude-sonnet-4-7",
+            timestamp: "2026-04-26T10:00:00Z",
+            derived_from: None,
+        });
+        let md = b.build().to_markdown();
+        assert!(
+            !md.contains("(approximate"),
+            "live capture must not surface approximate marker: {md}"
+        );
+    }
+
+    #[test]
     fn summary_line_pluralizes_correctly() {
         let mut b = TimelineBuilder::new("0.1.0");
         b.add_turn_line(&TurnLineInfo {
@@ -600,6 +700,7 @@ mod tests {
             prompt: "p",
             model: "m",
             timestamp: "2026-01-01T00:00:00Z",
+            derived_from: None,
         });
         let t = b.build();
         assert!(t
