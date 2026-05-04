@@ -13,8 +13,9 @@ can't easily reproduce in a real session (malformed payloads, stale
 staging dirs, specific edge regexes). Run both — they're complementary,
 not redundant.
 
-Stubs (`prov regenerate`, `prov backfill`) are listed at the end so you
-can confirm they still fail loudly rather than silently no-op.
+The remaining stub (`prov backfill`) is listed at the end so you can
+confirm it still fails loudly rather than silently no-op. (`prov
+regenerate` was dropped from v1; see the plan's U14 status note.)
 
 ## 0. Prerequisites
 
@@ -103,6 +104,58 @@ Reinstall before continuing:
 ```bash
 prov install --enable-push origin
 ```
+
+### Plugin install (alternative path) — U11
+
+`prov install` is the per-repo path. The Claude Code plugin shape (under
+`plugin/` in this repo) is the alternative for a global install across
+every repo where the `prov` binary is on `PATH`. The two paths register
+the same four hooks; the plugin path doesn't write `.git/hooks/...` or
+`.claude/settings.json` — Claude Code itself loads the plugin's
+`hooks/hooks.json` directly.
+
+```bash
+# `prov install --plugin` is informational only — it prints the
+# marketplace install command and exits without touching `.claude/`.
+prov install --plugin
+test -d "$SANDBOX/.claude" && echo "FAIL: --plugin should not create .claude/" \
+  || echo "OK: --plugin did not mutate the project"
+
+# Inspect the plugin manifest shipped with prov.
+PLUGIN_DIR="$(dirname "$(command -v prov)")/../../plugin"  # adjust if your binary lives elsewhere
+# When dogfooding from this repo:
+PLUGIN_DIR="/Users/matt/Documents/GitHub/prov/plugin"
+cat "$PLUGIN_DIR/.claude-plugin/plugin.json" | jq '.name, .version, .description'
+
+# Confirm the four hook events are registered with the right matchers and timeouts.
+jq '.hooks | keys' "$PLUGIN_DIR/hooks/hooks.json"
+# Expect: ["PostToolUse","SessionStart","Stop","UserPromptSubmit"]
+jq '.hooks.PostToolUse[0].matcher' "$PLUGIN_DIR/hooks/hooks.json"
+# Expect: "Edit|Write|MultiEdit"
+jq '.hooks.PostToolUse[0].hooks[0] | {type, command, timeout}' "$PLUGIN_DIR/hooks/hooks.json"
+# Expect: {"type":"command","command":"prov hook post-tool-use","timeout":5}
+
+# Local plugin install against a real Claude Code session — drop into a
+# fresh repo (so the per-repo `.claude/settings.json` from earlier doesn't
+# mask the plugin's hooks) and load the plugin from the local directory.
+PLUGIN_SANDBOX="$(mktemp -d /tmp/prov-plugin-sandbox-XXXX)"
+cd "$PLUGIN_SANDBOX"
+git init -q
+git commit --allow-empty -m "root"
+# In Claude Code (separate terminal):
+#   /plugin install --plugin-dir /Users/matt/Documents/GitHub/prov/plugin
+# Then run a session with at least one Edit/Write tool use, exit, and:
+git add . 2>/dev/null
+git commit -qm "plugin install smoke" || true
+ls .git/prov-staging/ 2>/dev/null && echo "OK: plugin path captured a session" \
+  || echo "FAIL: no staging dir — hooks didn't fire"
+cd "$SANDBOX"
+rm -rf "$PLUGIN_SANDBOX"
+```
+
+The automated layout lints in `crates/prov-cli/tests/cli_plugin_layout.rs`
+catch frontmatter regressions; the manual run above confirms the
+marketplace install path actually carries a session through capture.
 
 ## 2. End-to-end with a real Claude Code session
 
@@ -231,7 +284,89 @@ git notes --ref=refs/notes/prompts list | grep "$HEAD_BEFORE" \
   || echo "old SHA cleaned up"
 ```
 
-### 2.5 What "working end-to-end" means here
+### 2.5 Skill — agent-side trigger fidelity (U12)
+
+The Skill at `plugin/skills/prov/SKILL.md` teaches Claude Code to query
+its own provenance before substantive edits. Trigger fidelity (does the
+agent fire on the right asks, stay quiet on the wrong ones?) is what
+this section verifies — there is no automated harness for that.
+
+The four scenarios below are the load-bearing manual smoke. Run them
+after any meaningful edit to the SKILL frontmatter `description:` or
+body. The full test plan with iteration loop lives at
+`plugin/skills/prov/tests/skill_smoke.md`.
+
+**Setup once:** install the plugin (per the alternative-install section
+above) so the Skill ships alongside the hooks. Confirm via:
+
+```bash
+# In Claude Code: /skills should list `prov` with the trigger-rich description.
+# Or inspect on disk:
+cat /Users/matt/Documents/GitHub/prov/plugin/skills/prov/SKILL.md | head -20
+```
+
+You also need a fixture repo with at least one captured prov note —
+the sandbox from sections 2.1-2.4 already has this. Pick a real captured
+prompt to use as the "load-bearing" one in scenario 1.
+
+**Scenario 1 — substantive ask triggers the Skill.** In Claude Code,
+ask:
+
+> Refactor `src/greet.ts` to extract the greeting template into a
+> separate function.
+
+Pass criteria:
+- Agent calls `prov log src/greet.ts` (or `:<line>`) before proposing
+  edits.
+- Agent's plan cites the captured prompt verbatim and treats the prior
+  constraint as load-bearing.
+
+**Scenario 2 — trivial single-line change does NOT trigger.** Ask:
+
+> Fix the typo on line 12 of `README.md`.
+
+Pass criteria: no `prov log` invocation. The `paths:` glob excludes
+`*.md`, so the Skill should not even surface.
+
+**Scenario 3 — greenfield does NOT trigger.** Ask:
+
+> Create a new file `src/utils/format.ts` with a date formatter that
+> outputs `YYYY-MM-DD`.
+
+Pass criteria: either no `prov log` call, or one that returns empty
+(via `--only-if-substantial`) and the agent proceeds without surfacing
+it.
+
+**Scenario 4 — drifted line surfaces drift state.** First, hand-edit
+a line that was originally AI-written:
+
+```bash
+# Pick a line `prov log` reports as `unchanged`, edit it, commit.
+sed -i '' 's/friendly/warm/' src/greet.ts
+git commit -qam "human tweak"
+prov log src/greet.ts:1                      # expect status: drifted
+```
+
+Then ask Claude Code:
+
+> Explain `src/greet.ts:1`.
+
+Pass criteria: agent runs `prov log src/greet.ts:1`, surfaces both the
+original prompt AND the drift state ("hand-edited after the original AI
+write"), and frames its explanation around both.
+
+**If a scenario fails:** iterate on the `description:` field (false
+negatives → add trigger phrasing; false positives → strengthen the
+"When NOT to use it" body section). Re-run all four after each
+iteration; the trigger surface is global, so a tweak that fixes
+scenario 1 may regress scenario 2.
+
+The same content lints automated in `cli_skill_layout.rs` (frontmatter
+present, body ≤500 lines, references linked) catch regressions in the
+SKILL artifact itself; what they cannot catch is whether the agent
+actually fires correctly. That's why this section is manual.
+
+### 2.6 What "working end-to-end" means here
 
 By the end of section 2 you should have observed all of:
 
@@ -567,12 +702,17 @@ prov gc --compact --dry-run
 ## 10. Stubs (should fail loudly, not no-op)
 
 ```bash
-prov regenerate src/hello.ts:2 || echo "stub fail (expected)"
 prov backfill --yes              || echo "stub fail (expected)"
+
+# `prov regenerate` was dropped from v1 — it should be unknown, not stubbed.
+prov regenerate src/hello.ts:2 2>&1 | grep -q "unrecognized subcommand" \
+  && echo "OK: regenerate is gone, not stubbed" \
+  || echo "FAIL: regenerate either silently succeeded or is still wired as a stub"
 ```
 
-If either of these silently succeeds, that's a regression — they're
+If `prov backfill` silently succeeds, that's a regression — it's
 documented as not-yet-implemented and must surface that to the user.
+`prov regenerate` should be unknown to clap entirely.
 
 ## 11. Defensive-default regressions to verify
 
