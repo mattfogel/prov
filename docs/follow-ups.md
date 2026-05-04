@@ -32,15 +32,6 @@ with a commit/PR link).
   picks up Phase 2 polish or Phase 3 Skill work, since the Skill (U12)
   also has to know about commit-vs-staging to behave correctly.
 
-- [ ] **Populate `original_blob_sha` on matched edits.** The post-commit
-  flush currently writes `original_blob_sha: ""` because U3 does not yet
-  store the AI's full original output as a git blob. Without it, U14
-  (`prov regenerate`) has nothing to diff against. Capture-side fix: after
-  PostToolUse stages an edit, hash-object the `after` content via
-  `git hash-object --stdin -w`, store the returned SHA in the
-  `EditRecord`, and propagate into the `Edit` at flush time. Owner: U14
-  prerequisite; can land standalone or as part of U14.
-
 - [ ] **Partial-match cleanup of `edits.jsonl`.** The post-commit handler
   removes the entire session dir only when *every* staged edit matched
   the commit's diff. Partial-match cleanup (rewriting `edits.jsonl` to

@@ -215,8 +215,9 @@ pub enum ResolveResult {
         tool_use_id: Option<String>,
         /// AI-on-AI / backfill provenance link.
         derived_from: Option<DerivedFrom>,
-        /// Git blob SHA of the AI's original output (for `prov regenerate` diff).
-        /// `None` when the originating note did not record one.
+        /// Git blob SHA of the AI's original output. Reserved for downstream
+        /// tooling; no v1 CLI surface consumes it. `None` when the originating
+        /// note did not record one.
         original_blob_sha: Option<String>,
         /// Author who last touched the drifted line, per blame.
         blame_author_after: String,

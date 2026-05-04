@@ -46,8 +46,6 @@ enum Command {
     Repair(commands::repair::Args),
     /// Cull notes for unreachable commits and prune stale staging entries.
     Gc(commands::gc::Args),
-    /// Re-run the original prompt against a chosen model and diff against the stored output.
-    Regenerate(commands::regenerate::Args),
     /// Best-effort historical capture from stored Claude Code session transcripts.
     Backfill(commands::backfill::Args),
     /// Internal: hook-event dispatch (called by Claude Code hooks and git hooks).
@@ -71,7 +69,6 @@ fn main() -> anyhow::Result<()> {
         Command::RedactHistory(args) => commands::redact_history::run(args),
         Command::Repair(args) => commands::repair::run(args),
         Command::Gc(args) => commands::gc::run(args),
-        Command::Regenerate(args) => commands::regenerate::run(args),
         Command::Backfill(args) => commands::backfill::run(args),
         Command::Hook(args) => commands::hook::run(args),
     }
