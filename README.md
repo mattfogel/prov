@@ -52,6 +52,38 @@ By default, notes stay on your machine. To share with your team:
 prov sync enable origin              # opt in to push/fetch for this repo
 ```
 
+## GitHub Action
+
+Post a per-session "PR intent timeline" comment that walks the conversation behind the PR:
+
+```yaml
+# .github/workflows/prov-pr-timeline.yml
+name: prov pr-timeline
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  timeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0           # full history so blame can attribute every line
+      - uses: mattfogel/prov@<commit-sha>   # pin to a full SHA, not a tag
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          prov-version: v0.1.1     # pin to a specific release for reproducibility
+```
+
+The Action downloads the `prov` binary from GitHub Releases, verifies it via Sigstore cosign keyless attestation, and runs `prov pr-timeline --markdown` against the PR diff. The rendered comment is upserted in place on every push (filtered by both the sticky `<!-- prov:pr-timeline -->` marker *and* bot author identity to prevent spoofing).
+
+`fetch-depth: 0` is required: `git blame` falls back to "no provenance" for any line whose origin commit is shallow-pruned. Pin the Action to a full commit SHA — a tag can be moved post-release.
+
 ## Contributing
 
 Run `./scripts/check.sh` before opening a PR — it mirrors CI (build, test,
