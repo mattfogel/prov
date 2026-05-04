@@ -1,0 +1,19 @@
+{
+  "name": "prov",
+  "description": "Prompt provenance for Claude Code: capture each turn's prompt and edits as a git note on the resulting commit, then surface the originating prompt for any line via `prov log <file>:<line>`. Bundles the capture hooks (UserPromptSubmit, PostToolUse, Stop, SessionStart) and a Skill that teaches the agent to query its own prior reasoning before substantive edits.",
+  "version": "0.1.1",
+  "author": {
+    "name": "Matt Fogel",
+    "email": "mattfogel@gmail.com"
+  },
+  "homepage": "https://github.com/mattfogel/prov",
+  "repository": "https://github.com/mattfogel/prov",
+  "license": "MIT",
+  "keywords": [
+    "provenance",
+    "git-notes",
+    "claude-code",
+    "ai-attribution",
+    "code-review"
+  ]
+}

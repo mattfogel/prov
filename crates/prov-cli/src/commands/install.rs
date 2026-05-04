@@ -9,8 +9,9 @@
 //! - Adds prov's Claude Code hook entries to `.claude/settings.json`.
 //! - Initializes `<git-dir>/prov.db` and runs an initial reindex.
 //!
-//! `--plugin` is a stub (pre-v1: no marketplace listing); it prints the
-//! current-best install path and exits without modifying the repo.
+//! `--plugin` prints the Claude Code marketplace install command
+//! (`/plugin install prov`) and exits without modifying the project's
+//! `.claude/`. The plugin assumes the `prov` binary is on `PATH`.
 //! `--enable-push <REMOTE>` opts into team mode by adding the notes-tracking
 //! fetch refspec for the named remote. The pre-push gate that R6 promises
 //! ships in U8; until then `--enable-push` documents itself as "fetch only".
@@ -120,12 +121,19 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 }
 
 fn print_plugin_instructions() {
-    println!("Claude Code plugin install (pre-v1):");
+    println!("Claude Code plugin install:");
     println!();
-    println!("  Marketplace listing: not yet published.");
+    println!("  1. Install the prov binary so it's on PATH:");
+    println!("       cargo install prov");
+    println!("       # or: brew install mattfogel/tap/prov");
+    println!("       # or: curl -fsSL https://raw.githubusercontent.com/mattfogel/prov/main/install.sh | sh");
     println!();
-    println!("  Until then, install the prov binary (cargo / Homebrew / curl|sh)");
-    println!("  and run `prov install` inside each repo to wire hooks and config.");
+    println!("  2. Inside Claude Code, run:");
+    println!("       /plugin install prov");
+    println!();
+    println!("  (Note: `prov install --plugin` does not modify this project's");
+    println!("  .claude/ directory. Use `prov install` without --plugin for the");
+    println!("  per-repo install path that wires hooks and config locally.)");
 }
 
 // -------- git config --------

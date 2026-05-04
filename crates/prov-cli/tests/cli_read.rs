@@ -262,7 +262,7 @@ fn install_plugin_flag_does_not_touch_repo() {
         .args(["install", "--plugin"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Marketplace listing"));
+        .stdout(predicate::str::contains("/plugin install prov"));
 
     assert!(!tmp.path().join(".git/hooks/post-commit").exists());
     assert!(!tmp.path().join(".claude/settings.json").exists());
