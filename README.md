@@ -31,7 +31,9 @@ brew install mattfogel/tap/prov  # via Homebrew tap
 curl -fsSL https://raw.githubusercontent.com/mattfogel/prov/main/install.sh | sh  # cosign-verified
 ```
 
-Each release is signed with [Sigstore cosign](https://www.sigstore.dev/). The install script and the GitHub Action both verify the signature before exec — SHA256 alone is not enough against a release-asset compromise.
+Each release will be signed with [Sigstore cosign](https://www.sigstore.dev/) keyless once the release workflow ships. The install script and the GitHub Action both check signatures before exec — SHA256 alone is not enough against a release-asset compromise.
+
+> **Pre-release status:** the verification path exists in the Action and `install.sh` today, but the OIDC subject the verifier should pin against is not known until the release workflow exists. Until that lands, the verifier confirms the bundle chains to Fulcio and is logged in Rekor — but does **not** assert that *prov's* release workflow signed it. Treat this as a forward-looking integrity claim, not a today-claim. Tracked in [`docs/follow-ups.md`](docs/follow-ups.md#u13--github-action-pr-46).
 
 ## Quick start
 
@@ -51,6 +53,38 @@ By default, notes stay on your machine. To share with your team:
 ```bash
 prov sync enable origin              # opt in to push/fetch for this repo
 ```
+
+## GitHub Action
+
+Post a per-session "PR intent timeline" comment that walks the conversation behind the PR:
+
+```yaml
+# .github/workflows/prov-pr-timeline.yml
+name: prov pr-timeline
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  timeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0           # full history so blame can attribute every line
+      - uses: mattfogel/prov@<commit-sha>   # pin to a full SHA, not a tag
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          prov-version: v0.1.1     # pin to a specific release for reproducibility
+```
+
+The Action downloads the `prov` binary from GitHub Releases, verifies it via Sigstore cosign keyless attestation, and runs `prov pr-timeline --markdown` against the PR diff. The rendered comment is upserted in place on every push (filtered by both the sticky `<!-- prov:pr-timeline -->` marker *and* bot author identity to prevent spoofing).
+
+`fetch-depth: 0` is required: `git blame` falls back to "no provenance" for any line whose origin commit is shallow-pruned. Pin the Action to a full commit SHA — a tag can be moved post-release.
 
 ## Contributing
 

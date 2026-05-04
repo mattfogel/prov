@@ -76,6 +76,40 @@ with a commit/PR link).
 
 ---
 
+## U13 — GitHub Action (PR #46)
+
+- [ ] **Pin cosign verification to the release workflow's OIDC identity.**
+  `action/src/download.ts:defaultVerifier` calls `sigstore.verify(bundle,
+  artifact)` with the library's default policy — it confirms the
+  signature chains to Fulcio and the Rekor entry exists, but does NOT
+  assert *which* workflow produced the signature. A compromised
+  unrelated workflow in `mattfogel/prov` (or any future repo with write
+  access to the release ref) could in principle sign a bad binary that
+  would still verify. The strict check is to require the OIDC subject
+  match `https://github.com/mattfogel/prov/.github/workflows/release.yml@refs/tags/v*`
+  (exact subject TBD once the release workflow exists). sigstore-js v3
+  supports this via the `certificateIdentities` option on the verifier.
+  Cannot be implemented yet — the release workflow itself doesn't exist
+  (deferred to U1's release-plz/cargo-dist setup), so we don't know the
+  exact OIDC subject string to pin against. Verification: once the first
+  signed release lands, inspect the bundle's certificate (`cosign verify
+  --certificate-identity-regexp ...`), copy the subject into the
+  verifier, add a test that rejects a bundle signed by a different
+  workflow. Owner: whoever turns on the release workflow.
+
+- [ ] **Sanity-check `sigstore.verify` API shape against a real signed
+  bundle.** `defaultVerifier` is the right call shape per sigstore-js v3
+  docs but has not been exercised against a real release bundle —
+  there are no signed releases yet. The verifier is isolated behind
+  the `Verifier` type so a correction stays contained. Verification:
+  once the first signed release lands, run the Action against it in a
+  scratch repo workflow and confirm verification passes; if the call
+  signature has drifted, update `defaultVerifier` and the optional
+  `verifier` parameter on `downloadProv`. Owner: whoever turns on the
+  release workflow.
+
+---
+
 ## U15 — `prov backfill` (PR #45)
 
 These items surfaced in the multi-agent code review of PR #45 but were

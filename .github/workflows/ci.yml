@@ -43,3 +43,31 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  action:
+    name: action (TypeScript)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: action
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: action/package-lock.json
+      - run: npm ci
+      - name: tsc --noEmit
+        run: npm run lint
+      - name: jest
+        run: npm test
+      - name: ncc build
+        run: npm run build
+      - name: dist/ is up to date
+        run: |
+          if ! git diff --quiet -- dist/; then
+            echo "::error::Committed dist/ is stale. Run 'npm run build' inside action/ and commit the result."
+            git --no-pager diff dist/ | head -200
+            exit 1
+          fi
