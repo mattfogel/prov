@@ -36,7 +36,7 @@ Code is increasingly written by AI, but the systems that explain code (git blame
 - R10. Privacy CLI: `prov mark-private <commit>`, `prov redact-history <pattern>` (rewrite the notes ref to retroactively scrub a newly discovered secret format).
 - R11. Claude Code Skill at `skills/prov/SKILL.md` teaches the agent to query `prov log` before substantive edits to files with existing provenance; surfaces relevant prior prompts in its planning.
 - R12. GitHub Action posts one "PR intent timeline" comment per session per PR, edits in place on PR updates, organizes turns chronologically, collapses superseded turns, drops turns whose edits did not survive into the final diff.
-- R13. `prov regenerate <file>:<line> --model <name>` replays the original prompt against a chosen model and renders a diff against the stored `original_blob_sha`.
+- ~~R13.~~ *(dropped 2026-05-04 — `prov regenerate` had a high noise floor against stochastic models and added a network surface that fought the project's "no hosted services, no network requests except sync" posture. See "Alternative Approaches Considered" for rationale.)*
 - R14. `prov backfill` reads stored Claude Code session logs (`~/.claude/projects/<sanitized-cwd>/<session-uuid>.jsonl` — sanitized-cwd replaces `/` with `-`, leading `-` preserved) and creates approximate notes for historical commits via fuzzy matching, marking each as `(approximate)`.
 - R15. Distribution: single static binary via `cargo install`, Homebrew tap (`brew install matt/tap/prov`), and `curl | sh` script. macOS unsigned for v1; document `xattr` workaround.
 - R16. No telemetry, no hosted services, no analytics. Apache 2.0 licensed.
@@ -137,7 +137,6 @@ None — `prov/docs/solutions/` does not exist yet. As v1 ships, capture lessons
 - **Backfill match confidence threshold** (open question 2 from the brief): All matches surface with `(approximate)` marker in v1; threshold tuning happens after real-world feedback. Implementation simply records the highest-confidence match per commit.
 - **Skill triggering precision** (open question 3 from the brief): Prose-only gating in v1. Real triggering policy emerges from user feedback in v1.x.
 - **Action — handling PRs with multiple Claude Code conversations from different authors**: v1 groups strictly by `session_id`. Cross-author multi-conversation rendering is deferred.
-- **Anthropic API key handling for `prov regenerate`**: Use `ANTHROPIC_API_KEY` env var; fail explicitly if absent. Storing keys, key rotation, and rate-limit backoff are deferred to v1.x.
 - **Compaction at 90 days**: brief proposes dropping `preceding_turns_summary` for old notes. Implementation as a `prov gc --compact` flag, default off in v1; turn on once storage growth is observed in real use.
 
 ### Deferred from Document Review (2026-04-28)
@@ -159,7 +158,7 @@ These were surfaced by the post-write document review and deferred for explicit 
 
 - **PR intent timeline value to reviewers — behavioral acceptance criterion.** The PR timeline is one of three claimed differentiators. Plan's only verification is "visually confirm the comment." Define a behavioral acceptance criterion before declaring the Action shipped: in N real PRs reviewed by M reviewers who didn't write the code, ask whether the timeline comment changed their review (caught a missed context, surfaced a constraint, or was ignored). If ignored in >half of cases, redesign the surface (in-line annotations? expandable in the diff view?) before doubling down. *(product-lens, P2)*
 
-- **`prov regenerate` as v1 vs v1.x.** Adds an Anthropic API client (HTTP, auth, rate limits, retry, model deprecations) to a tool whose stated posture is "no hosted services, no network requests." User value is narrow (re-run a stored prompt against a different model and diff the output); maintenance surface is wide. For a one-maintainer time-permits OSS project, defer U14 to v1.x as a separate companion crate or community-maintained extension? The core "capture, resolve, share, redact" value proposition does not depend on it. *(product-lens, P3 — but interacts with the scope-vs-posture question above)*
+- **`prov regenerate` as v1 vs v1.x.** Adds an Anthropic API client (HTTP, auth, rate limits, retry, model deprecations) to a tool whose stated posture is "no hosted services, no network requests." User value is narrow (re-run a stored prompt against a different model and diff the output); maintenance surface is wide. For a one-maintainer time-permits OSS project, defer U14 to v1.x as a separate companion crate or community-maintained extension? The core "capture, resolve, share, redact" value proposition does not depend on it. *(product-lens, P3 — but interacts with the scope-vs-posture question above)* **→ Resolved 2026-05-04: U14 dropped entirely (not deferred to v1.x). Single-sample stochastic regeneration was judged not to clear the noise floor regardless of whether it shipped now or later. See U14's status note for full rationale.**
 
 - **`prov backfill` against undocumented transcript format — defer to v1.1?** U15 builds a parser for a transcript JSONL format that is not formally documented and requires "empirical inspection." If the format changes between Claude Code versions, backfill silently produces zero matches with no user-visible error. Defer U15 to v1.1 with the explicit condition "ship once the transcript path convention is confirmed via empirical inspection and documented"? Interim `prov backfill` stub can print "Run `prov hook user-prompt-submit` once to discover your transcript path, then file an issue with the format — backfill will be calibrated against real data." *(scope-guardian, P2 — interacts with the regenerate question and the scope-vs-posture question)*
 
@@ -214,7 +213,6 @@ The repo layout `prov install` and the user expect to see after v1 ships:
     │       │   │   ├── notes_resolve.rs
     │       │   │   ├── mark_private.rs
     │       │   │   ├── redact_history.rs
-    │       │   │   ├── regenerate.rs
     │       │   │   ├── backfill.rs
     │       │   │   ├── pr_timeline.rs      # local preview of the GitHub Action's comment
     │       │   │   └── hook.rs             # `prov hook <event>` dispatch
@@ -351,7 +349,7 @@ resolve(file, line) →
        differ → status: drifted, blame_author_after_drift
        absent → status: no_provenance_for_this_line
   6. Return { prompt, model, timestamp, conversation_id, status,
-              derived_from, regenerate_url }
+              derived_from }
 ```
 
 Same function called by CLI, Skill (via CLI), and the GitHub Action.
@@ -382,7 +380,7 @@ This PR contains 17 turns across 2 Claude Code sessions, plus 4 lines without pr
 ### 4 lines without provenance
 - `src/index.ts:1-4` — pre-existing or human-authored. Run `prov backfill` to attempt historical capture.
 
-[Generated by Prov v1.0.0 · regenerate any turn with `prov regenerate <file>:<line> --model <name>`]
+[Generated by Prov v1.0.0 · query any turn with `prov log <file>:<line>`]
 ```
 
 The `<details>` collapse and the "superseded" handling are what make this scale to noisy conversations. The "lines without provenance" footer is intentionally small — the Action does not annotate them.
@@ -857,7 +855,7 @@ A team can fetch and push provenance notes between machines, with airtight redac
 
 ### Phase 3 — Agent and Review Surfaces (the differentiated value)
 
-The Skill makes Claude Code aware of its own past reasoning; the GitHub Action gives reviewers a PR intent timeline; `regenerate` and `backfill` round out the CLI.
+The Skill makes Claude Code aware of its own past reasoning; the GitHub Action gives reviewers a PR intent timeline; `backfill` rounds out the CLI for historical capture.
 
 - U11. **Claude Code Plugin packaging**
 
@@ -983,37 +981,11 @@ The Skill makes Claude Code aware of its own past reasoning; the GitHub Action g
 
 ---
 
-- U14. **`prov regenerate <file>:<line> --model <name>`**
+- ~~U14. **`prov regenerate <file>:<line> --model <name>`**~~ *(dropped 2026-05-04)*
 
-**Goal:** Replay the original prompt for a given line against a chosen model and render a diff against the stored `original_blob_sha`.
+**Status:** Dropped after PR #42 reached "ready to merge". Models are stochastic; a single-sample regeneration against the captured prompt produces a diff dominated by sampling artifacts rather than signal about the prompt or the code. The two marginal use cases (model comparison across upgrades, prompt-to-code sanity checks) are weak as one-shot diffs and don't justify the added Anthropic-API surface, the maintenance cost (rate limits, model deprecations, key handling), or the violation of the project's "no hosted services, no network requests except sync" posture. The captured prompt itself — already exposed via `prov log` and surfaced to agents via the U12 Skill — is the real differentiated value; regenerate adds API spend without answering a question `prov log` doesn't already answer better. The product-lens review during planning had already flagged this concern (P3 in "Deferred from Document Review" → "regenerate as v1 vs v1.x").
 
-**Requirements:** R13
-
-**Dependencies:** U4 (resolver), U2 (storage; needs `original_blob_sha` blob still reachable)
-
-**Files:**
-- Create: `crates/prov-cli/src/commands/regenerate.rs`, `crates/prov-cli/src/anthropic.rs` (thin Anthropic API client — kept in prov-cli to avoid leaking network/HTTP dependencies into prov-core, which is the embeddable library surface)
-- Test: `crates/prov-cli/tests/cli_regenerate.rs` (uses a mock HTTP server)
-
-**Approach:**
-- `prov regenerate <file>:<line> [--model <name>]` resolves the line, reads `original_blob_sha` content via `git cat-file blob`, calls Anthropic's API with the original `prompt` + `preceding_turns_summary` (if available), receives a fresh response, renders a side-by-side or unified diff against the original.
-- Default model: same as the stored note's `model` field. `--model` overrides.
-- **API key handling:** read `ANTHROPIC_API_KEY` from env at startup, immediately move it into an owned `String`, then call `std::env::remove_var("ANTHROPIC_API_KEY")` so any subprocess (or panic backtrace dump) cannot recover it from the environment. Explicit error if absent. The Anthropic HTTP client wraps its error type in a redacting `Display` impl so `Authorization` header values are never printed to logs (including `.git/prov-staging/log` and any structured-error output). Never write env-dump diagnostics to staging/log.
-- HTTP client: `reqwest` with `rustls` feature.
-
-**Patterns to follow:**
-- Anthropic Messages API (cite docs); use prompt caching for the system prompt if applicable.
-
-**Test scenarios:**
-- *Happy path* — mocked API returns deterministic text → diff renders correctly.
-- *Edge case* — `original_blob_sha` no longer reachable (gc'd): error with clear message and suggestion to regenerate without diff (still call API, just no comparison).
-- *Edge case* — line has `derived_from` chain: regenerate uses the most recent prompt by default, `--root` flag uses the original.
-- *Error path* — `ANTHROPIC_API_KEY` unset: clear error, exit 1, no API call attempted.
-- *Error path* — API returns 429 (rate limit): print the retry-after header and exit non-zero.
-
-**Verification:**
-- Mock HTTP tests pass.
-- Manual test: regenerate a real line against `claude-haiku-4-5` (cheap), verify diff renders.
+`original_blob_sha` is left in the schema as an optional, forward-compatible field with no v1 reader. A future non-stochastic feature (e.g., raw text recovery for offline diffing) could consume it without re-introducing the network surface.
 
 ---
 
@@ -1069,7 +1041,7 @@ The Skill makes Claude Code aware of its own past reasoning; the GitHub Action g
 - **State lifecycle risks.** The biggest risk is staging-state corruption: a session's staging files get inconsistent state if the hook is killed mid-write. Mitigation: append-only JSONL for edits, atomic write-and-rename for turn metadata, defensive parsing on read (skip malformed lines, log).
 - **API surface parity.** The CLI, Skill (via CLI), and GitHub Action all call the same `prov-core::resolver`. Adding a new resolution capability lights up everywhere.
 - **Integration coverage.** The end-to-end fixture test in U5 (install → simulated session → commit → `prov log` works) is the load-bearing integration test. Phase 2 milestone adds a multi-machine integration test (clone twice, push notes between, conflicts resolved). Phase 3 milestone adds a real-PR action test.
-- **Unchanged invariants.** Prov never modifies user code, never rewrites the user's branch refs, never auto-pushes anything (push happens only on explicit `git push` or `prov push`), never runs network requests except in `prov regenerate` (Anthropic) and `prov push`/`prov fetch` (the configured remote). The pre-push gate may block a user push but cannot mutate it.
+- **Unchanged invariants.** Prov never modifies user code, never rewrites the user's branch refs, never auto-pushes anything (push happens only on explicit `git push` or `prov push`), never runs network requests except `prov push`/`prov fetch` to the configured git remote. The pre-push gate may block a user push but cannot mutate it.
 
 ---
 

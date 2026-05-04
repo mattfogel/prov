@@ -6,10 +6,12 @@
 //! v1 is preserved by tolerating unknown sibling fields (no `deny_unknown_fields`) —
 //! a v1.x release adding an optional field stays parseable by older v1 readers.
 //!
-//! Per-line `content_hashes` enable drift detection at resolve time. `original_blob_sha`
-//! references the AI's full original output stored as a git blob, enabling
-//! regenerate-and-diff. `derived_from` is a tagged union distinguishing AI-on-AI
-//! rewrites from `prov backfill`-created notes.
+//! Per-line `content_hashes` enable drift detection at resolve time.
+//! `original_blob_sha` is reserved for downstream consumers that want to
+//! recover the AI's full original output (no v1 surface reads it today —
+//! the field stays optional and forward-compatible). `derived_from` is a
+//! tagged union distinguishing AI-on-AI rewrites from `prov backfill`-
+//! created notes.
 
 use serde::{Deserialize, Serialize};
 
@@ -76,10 +78,11 @@ pub struct Edit {
     /// Enables drift detection: a current line whose hash matches `content_hashes[i]`
     /// is unchanged since AI capture; a mismatch means a human edited the line.
     pub content_hashes: Vec<String>,
-    /// Git blob SHA of the AI's full original output (stored separately as a git
-    /// blob so `prov regenerate` can diff the regenerated text against the original).
-    /// Optional: U3's capture pipeline stages edits before a blob exists, and
-    /// older notes did not always carry one. Absent on serialize when `None`.
+    /// Git blob SHA of the AI's full original output, when capture stored one.
+    /// Reserved for downstream tooling that wants to recover the original text
+    /// (no v1 CLI surface reads it today — the field stays optional and
+    /// forward-compatible). Older notes did not always carry one. Absent on
+    /// serialize when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_blob_sha: Option<String>,
     /// The user prompt that produced this edit (post-redaction).

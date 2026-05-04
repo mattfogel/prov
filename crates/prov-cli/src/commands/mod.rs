@@ -16,7 +16,6 @@ pub mod notes_resolve;
 pub mod pr_timeline;
 pub mod push;
 pub mod redact_history;
-pub mod regenerate;
 pub mod reindex;
 pub mod repair;
 pub mod search;

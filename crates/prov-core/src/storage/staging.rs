@@ -336,7 +336,7 @@ pub struct TurnRecord {
     /// `private/` subtree so it never reaches `refs/notes/prompts`.
     pub private: bool,
     /// `transcript_path` from the hook payload, when surfaced. Lets
-    /// `prov regenerate` and `prov backfill` find historical context.
+    /// `prov backfill` find historical context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_path: Option<String>,
     /// Working directory the hook was invoked from.

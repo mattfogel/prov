@@ -39,7 +39,6 @@ fn help_lists_every_v1_subcommand() {
         "redact-history",
         "repair",
         "gc",
-        "regenerate",
         "backfill",
     ];
 
