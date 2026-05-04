@@ -24,11 +24,19 @@ serde_json = "1.0"
 thiserror = "2.0"
 blake3 = "1.5"
 regex = "1.11"
+# `prov regenerate` (U14) calls the Anthropic Messages API. rustls-tls keeps
+# the static-musl release path simple; blocking matches the rest of the CLI's
+# sync style. Default features are off so we don't pull in tokio.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
+similar = "2.6"
 
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.1"
 tempfile = "3.13"
+# Mock HTTP server for `prov regenerate` integration tests. Sync API matches
+# our blocking reqwest client.
+mockito = "1.5"
 
 [lints]
 workspace = true

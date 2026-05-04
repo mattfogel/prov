@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod anthropic;
 mod commands;
 mod render;
 
