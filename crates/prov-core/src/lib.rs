@@ -6,12 +6,14 @@
 //! can depend on this crate without inheriting the CLI's surface.
 
 pub mod git;
+pub mod privacy;
 pub mod redactor;
 pub mod resolver;
 pub mod schema;
 pub mod session;
 pub mod storage;
 pub mod time;
+pub mod transcript;
 
 pub use resolver::{NoProvenanceReason, ResolveResult, Resolver, ResolverError};
 pub use schema::SCHEMA_VERSION;

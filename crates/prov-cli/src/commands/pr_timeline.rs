@@ -76,6 +76,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                     timestamp,
                     conversation_id,
                     turn_index,
+                    derived_from,
                     ..
                 }
                 | ResolveResult::Drifted {
@@ -84,6 +85,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                     timestamp,
                     conversation_id,
                     turn_index,
+                    derived_from,
                     ..
                 } => {
                     surviving_turns.insert((conversation_id.clone(), turn_index));
@@ -94,6 +96,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                         prompt: &prompt,
                         model: &model,
                         timestamp: &timestamp,
+                        derived_from: derived_from.as_ref(),
                     });
                 }
                 ResolveResult::NoProvenance { .. } => {
@@ -174,6 +177,7 @@ fn add_superseded(
                 prompt: &edit.prompt,
                 model: &edit.model,
                 timestamp: &edit.timestamp,
+                derived_from: edit.derived_from.as_ref(),
             });
         }
     }
