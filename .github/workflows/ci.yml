@@ -66,7 +66,7 @@ jobs:
         run: npm run build
       - name: dist/ is up to date
         run: |
-          if [ -n "$(git status --porcelain dist/)" ]; then
+          if ! git diff --quiet -- dist/; then
             echo "::error::Committed dist/ is stale. Run 'npm run build' inside action/ and commit the result."
             git --no-pager diff dist/ | head -200
             exit 1

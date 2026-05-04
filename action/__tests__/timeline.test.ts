@@ -1,6 +1,5 @@
 import { renderTimeline, type ExecFn } from '../src/timeline';
-
-const STICKY_MARKER = '<!-- prov:pr-timeline -->';
+import { STICKY_MARKER } from '../src/github';
 
 const makeExec = (opts: {
   exitCode: number;

@@ -41,7 +41,12 @@ inputs:
 
 outputs:
   comment-id:
-    description: 'GitHub ID of the upserted PR comment, or empty if no comment was posted.'
+    description: |
+      GitHub numeric ID of the upserted PR comment as a string, or the empty
+      string when no comment was posted (non-pull_request event, or the
+      timeline renderer produced no body). The output is always set, never
+      absent — downstream steps can rely on `outputs.comment-id == ''` to
+      detect the no-post case.
 
 runs:
   using: 'node20'

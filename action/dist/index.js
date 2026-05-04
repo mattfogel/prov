@@ -68233,6 +68233,10 @@ const download_1 = __nccwpck_require__(1531);
 const timeline_1 = __nccwpck_require__(1472);
 const github_2 = __nccwpck_require__(9248);
 async function run() {
+    // Default the output to empty string up front so the early-exit paths
+    // (non-PR event, empty body) emit a present-but-empty value rather than
+    // an absent key. Consumers writing `outputs.comment-id == ''` then match.
+    core.setOutput('comment-id', '');
     try {
         const token = core.getInput('github-token', { required: true });
         const version = core.getInput('prov-version');

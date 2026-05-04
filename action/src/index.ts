@@ -23,6 +23,10 @@ import { renderTimeline } from './timeline';
 import { newCommentClient, upsertStickyComment } from './github';
 
 async function run(): Promise<void> {
+  // Default the output to empty string up front so the early-exit paths
+  // (non-PR event, empty body) emit a present-but-empty value rather than
+  // an absent key. Consumers writing `outputs.comment-id == ''` then match.
+  core.setOutput('comment-id', '');
   try {
     const token = core.getInput('github-token', { required: true });
     const version = core.getInput('prov-version');

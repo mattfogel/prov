@@ -31,7 +31,9 @@ brew install mattfogel/tap/prov  # via Homebrew tap
 curl -fsSL https://raw.githubusercontent.com/mattfogel/prov/main/install.sh | sh  # cosign-verified
 ```
 
-Each release is signed with [Sigstore cosign](https://www.sigstore.dev/). The install script and the GitHub Action both verify the signature before exec — SHA256 alone is not enough against a release-asset compromise.
+Each release will be signed with [Sigstore cosign](https://www.sigstore.dev/) keyless once the release workflow ships. The install script and the GitHub Action both check signatures before exec — SHA256 alone is not enough against a release-asset compromise.
+
+> **Pre-release status:** the verification path exists in the Action and `install.sh` today, but the OIDC subject the verifier should pin against is not known until the release workflow exists. Until that lands, the verifier confirms the bundle chains to Fulcio and is logged in Rekor — but does **not** assert that *prov's* release workflow signed it. Treat this as a forward-looking integrity claim, not a today-claim. Tracked in [`docs/follow-ups.md`](docs/follow-ups.md#u13--github-action-pr-46).
 
 ## Quick start
 
