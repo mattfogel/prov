@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "edits": [
+    {
+      "file": "docs/plans/2026-04-28-001-feat-prompt-provenance-v1-plan.md",
+      "line_range": [
+        33,
+        33
+      ],
+      "content_hashes": [
+        "bc49bc6cb2f7c7544585ec721caeb3b36d3cf8ed939238aaf90f7d8d7b0413cf"
+      ],
+      "prompt": "yes",
+      "conversation_id": "0f7d85a3-7122-4db1-8d97-cf812b865335",
+      "turn_index": 1,
+      "tool_use_id": "toolu_01KAL6MQ36JzuEQnu6TQorU9",
+      "model": "claude-sonnet-4-6",
+      "tool": "claude-code",
+      "timestamp": "2026-05-07T19:01:44Z"
+    },
+    {
+      "file": "docs/plans/2026-04-28-001-feat-prompt-provenance-v1-plan.md",
+      "line_range": [
+        38,
+        38
+      ],
+      "content_hashes": [
+        "3dc6473d34e4c94a889eceb747e10caadf07bb724e0582589885b4e4dfa747bf"
+      ],
+      "prompt": "yes",
+      "conversation_id": "0f7d85a3-7122-4db1-8d97-cf812b865335",
+      "turn_index": 1,
+      "tool_use_id": "toolu_018qQjHU9CrEi3aGpFErawUx",
+      "model": "claude-sonnet-4-6",
+      "tool": "claude-code",
+      "timestamp": "2026-05-07T19:01:52Z"
+    }
+  ]
+}
