@@ -30,12 +30,12 @@ Code is increasingly written by AI, but the systems that explain code (git blame
 - R4. Redact known-secret patterns (AWS, Stripe, GitHub PAT, JWT, email, high-entropy strings, project-specific `.provignore` regexes) at write time, before the note is created.
 - R5. Mark prompts private via inline `# prov:private` magic phrase or retroactive `prov mark-private <commit>`. Private notes never push.
 - R6. Pre-push gate scans notes being pushed for known-secret patterns and blocks the push (overridable with `--no-verify`).
-- R7. Read CLI: `prov log <file>[:<line>]`, `prov log <file> --history`, `prov log <file>:<line> --full`, `prov search <query>`, `prov reindex`, `prov pr-timeline --base <ref> --head <ref>` (local preview of the GitHub Action's comment).
+- R7. Read CLI: `prov log <file>[:<line>]`, `prov log <file> --history`, `prov log <file>:<line> --full`, `prov search <query>`, `prov reindex`, `prov pr-timeline --base <ref> --head <ref>` (renders the PR intent timeline locally — see `crates/prov-cli/src/render/timeline.rs`).
 - R8. Sync CLI: `prov fetch`, `prov push`, `prov install` (configures git refspecs, `notes.displayRef`, `notes.rewriteRef`, registers hooks), `prov uninstall`.
 - R9. History/rewrite CLI: `prov repair` (walks reflog, reattaches orphaned notes), `prov gc` (culls notes whose target commit no longer exists), `prov notes resolve` (manual JSON-aware merge for the notes ref).
 - R10. Privacy CLI: `prov mark-private <commit>`, `prov redact-history <pattern>` (rewrite the notes ref to retroactively scrub a newly discovered secret format).
 - R11. Claude Code Skill at `skills/prov/SKILL.md` teaches the agent to query `prov log` before substantive edits to files with existing provenance; surfaces relevant prior prompts in its planning.
-- R12. GitHub Action posts one "PR intent timeline" comment per session per PR, edits in place on PR updates, organizes turns chronologically, collapses superseded turns, drops turns whose edits did not survive into the final diff.
+- ~~R12.~~ *(dropped 2026-05-07 — unshipped per `docs/plans/2026-05-07-001-refactor-unship-pr-comment-action-plan.md`. The CLI command `prov pr-timeline` stays as a local query surface; the GitHub Action that posted the comment to PRs was removed because automatically-posted review-time comments don't fit the tool's "queryable by users and models" framing. Revival anchor: commit `e1dfbd8`.)*
 - ~~R13.~~ *(dropped 2026-05-04 — `prov regenerate` had a high noise floor against stochastic models and added a network surface that fought the project's "no hosted services, no network requests except sync" posture. See "Alternative Approaches Considered" for rationale.)*
 - R14. `prov backfill` reads stored Claude Code session logs (`~/.claude/projects/<sanitized-cwd>/<session-uuid>.jsonl` — sanitized-cwd replaces `/` with `-`, leading `-` preserved) and creates approximate notes for historical commits via fuzzy matching, marking each as `(approximate)`.
 - R15. Distribution: single static binary via `cargo install`, Homebrew tap (`brew install matt/tap/prov`), and `curl | sh` script. macOS unsigned for v1; document `xattr` workaround.
@@ -936,6 +936,8 @@ The Skill makes Claude Code aware of its own past reasoning; the GitHub Action g
 ---
 
 - U13. **GitHub Action (PR intent timeline comment)**
+
+**Status:** Dropped — see `docs/plans/2026-05-07-001-refactor-unship-pr-comment-action-plan.md`. Revival anchor: commit `e1dfbd8`.
 
 **Goal:** Implement the CI-side surface that posts the per-session timeline comment on PRs.
 
