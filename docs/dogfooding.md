@@ -491,45 +491,6 @@ git checkout -q main
 Edge case worth eyeballing: a PR with >5,000 added lines should mark the
 overflow under "no provenance" rather than truncating silently.
 
-### GitHub Action — U13
-
-The `action/` package wraps `prov pr-timeline --markdown` for CI. Smoke
-the TypeScript surface from the repo root:
-
-```bash
-cd /Users/matt/Documents/GitHub/prov/action
-npm ci
-npm run lint                      # tsc --noEmit
-npm test                          # jest — 28 cases across upsert, download, timeline
-npm run build                     # ncc bundles dist/index.js (committed)
-git status --porcelain dist/      # empty — committed dist/ matches the source
-```
-
-End-to-end with the rendered Markdown body (no GitHub round-trip):
-
-```bash
-cd "$SANDBOX"
-git checkout -q -b feature
-# Make a captured edit on the branch.
-prov pr-timeline --base main --head HEAD --markdown > /tmp/timeline.md
-head -3 /tmp/timeline.md          # `<!-- prov:pr-timeline -->` on line 1
-grep -c '^### Session' /tmp/timeline.md   # one heading per session
-git checkout -q main
-```
-
-The Action's load-bearing properties (sticky-comment upsert, marker +
-bot-author filter against spoofing, 65,536-char truncation) live in
-`action/src/github.ts` and are covered by `__tests__/github.test.ts`.
-Author-spoof prevention is the most important guarantee: a contributor
-who pre-places a comment with the marker but is not the bot must not
-have it edited. The "refuses to edit a marker-spoofing comment" test
-encodes that.
-
-For a true end-to-end run you need a release with a signed binary —
-v1 ships the Action ahead of the first release. Once `v0.1.x` is cut
-with cosign-signed assets, point a scratch workflow at this Action
-pinned to a commit SHA and verify the comment appears on a test PR.
-
 ## 5. Cache / reindex
 
 ```bash
