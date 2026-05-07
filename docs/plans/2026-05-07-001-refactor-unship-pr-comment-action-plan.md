@@ -1,7 +1,7 @@
 ---
 title: "refactor: Unship the U13 PR-comment GitHub Action"
 type: refactor
-status: active
+status: completed
 date: 2026-05-07
 ---
 
