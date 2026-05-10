@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "SessionStart",
+  "session_id": "codex_fixture001",
+  "cwd": "/tmp/prov-fixture",
+  "model": "gpt-5.4-codex",
+  "transcript_path": null
+}

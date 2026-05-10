@@ -5,9 +5,9 @@ suite has caught regressions on at least once. Use this when validating a
 release candidate, after a refactor that touches a hot path, or when you
 just want to feel the surface from a user's seat.
 
-The capture flow is exercised two ways. Section 2 drives a **real Claude
-Code session** end-to-end — the only way to prove that what the agent
-actually emits matches what `prov hook ...` actually consumes. Section 3
+The capture flow is exercised two ways. Section 2 drives a **real agent
+session** end-to-end — the only way to prove that what the harness actually
+emits matches what `prov hook ...` consumes. Section 3
 drives the same hook handlers with hand-crafted JSON for everything you
 can't easily reproduce in a real session (malformed payloads, stale
 staging dirs, specific edge regexes). Run both — they're complementary,
@@ -58,28 +58,37 @@ git -C "$SANDBOX" remote add origin "$PEER"
 cd "$SANDBOX"
 prov install
 ls .git/hooks/                    # post-commit, pre-push, post-rewrite present
-cat .claude/settings.json         # 4 prov hook entries (SessionStart, UserPromptSubmit, PostToolUse, Stop)
+test ! -e .claude/settings.json && echo "no Claude adapter config yet"
+test ! -e .codex/hooks.json && echo "no Codex adapter config yet"
 git config --get notes.displayRef         # refs/notes/prompts
 git config --get notes.mergeStrategy      # manual
 git config --get notes.rewrite.amend      # false
 test -f .git/prov.db && echo "cache OK"
+
+prov install --agent claude
+cat .claude/settings.json         # 4 Claude hook entries
+
+prov install --agent codex
+cat .codex/config.toml            # [features] codex_hooks = true
+cat .codex/hooks.json             # 4 Codex hook entries
 ```
 
 ### Edge cases
 
 ```bash
 # Idempotent re-install: same on-disk state, no duplicate hook blocks.
-prov install
+prov install --agent all
 grep -c '# >>> prov' .git/hooks/post-commit          # exactly 1
 grep -c '"command": "prov hook' .claude/settings.json # exactly 4
+grep -c '"command": "prov hook codex' .codex/hooks.json # exactly 4
 
 # Pre-existing user content in a hook: prov block is added/refreshed in place.
 echo 'echo user-hook' >> .git/hooks/post-commit
-prov install
+prov install --agent all
 grep -A1 '# <<< prov' .git/hooks/post-commit         # user content survives
 
 # Team-mode opt-in (writes a fetch refspec, arms the pre-push gate).
-prov install --enable-push origin
+prov install --agent all --enable-push origin
 git config --get-all remote.origin.fetch             # includes refs/notes/prompts:refs/notes/origin/prompts
 
 # Uninstall removes prov-managed lines but leaves your data.
@@ -89,7 +98,7 @@ test -f .git/prov.db && echo "cache preserved (expected)"
 git for-each-ref refs/notes/                          # notes ref untouched
 
 # --purge also drops cache and staging.
-prov install
+prov install --agent all
 prov uninstall --purge
 test -f .git/prov.db || echo "cache gone"
 test -d .git/prov-staging || echo "staging gone"
@@ -102,7 +111,7 @@ prov uninstall --purge   # no error
 Reinstall before continuing:
 
 ```bash
-prov install --enable-push origin
+prov install --agent all --enable-push origin
 ```
 
 ### Plugin install (alternative path) — U11
@@ -157,7 +166,23 @@ The automated layout lints in `crates/prov-cli/tests/cli_plugin_layout.rs`
 catch frontmatter regressions; the manual run above confirms the
 marketplace install path actually carries a session through capture.
 
-## 2. End-to-end with a real Claude Code session
+## 2. End-to-end with a real agent session
+
+Run the Claude path and, when Codex is available, repeat the same flow in
+Codex. For Codex, the repo-local `.codex/` config layer must be trusted before
+project hooks run.
+
+### 2.0 Codex quick smoke
+
+```bash
+cd "$SANDBOX"
+prov install --agent codex
+# Reopen Codex in this repo after trusting `.codex/`, then make a small
+# apply_patch-backed edit and commit it.
+git add . && git commit -qm "feat: codex smoke"
+prov log <edited-file>
+git notes --ref=refs/notes/prompts show HEAD | jq '.edits[0].tool' # "codex"
+```
 
 This is the integration smoke test. You're verifying that Claude Code
 actually invokes the four registered hooks with the JSON shapes
@@ -167,7 +192,7 @@ section 3 will lie to you — the simulator and reality have drifted.
 
 > **Restart Claude Code first.** `.claude/settings.json` is read at
 > session start; if the project's settings file was just written by
-> `prov install`, an already-running CLI won't see the new hook entries.
+> `prov install --agent claude`, an already-running CLI won't see the new hook entries.
 
 ### 2.1 Capture, read, search (golden path)
 
@@ -752,8 +777,9 @@ unset SANDBOX PEER CLONE SID SHA HEAD_BEFORE HEAD_AFTER ORPHAN_OLD ORPHAN_NEW DE
 
 ## Appendix: troubleshooting
 
-- **Hook didn't fire after `prov install`.** Restart Claude Code —
-  `.claude/settings.json` is read at session start. For git hooks,
+- **Hook didn't fire after `prov install`.** Restart the agent harness.
+  Claude Code reads `.claude/settings.json` at session start; Codex must trust
+  the repo-local `.codex/` layer before project hooks run. For git hooks,
   confirm `core.hooksPath` is unset (or includes `.git/hooks`) and
   inspect `.git/hooks/post-commit` for the `# >>> prov` block.
 - **Note not visible after commit.** Run `prov reindex`. The post-commit

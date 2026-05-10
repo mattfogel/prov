@@ -1,8 +1,8 @@
 //! `prov uninstall` — reverse `prov install`.
 //!
 //! Removes the prov-managed `# >>> prov` / `# <<< prov` block from any hook
-//! script, strips prov hook entries from `.claude/settings.json`, unsets the
-//! git config keys `prov install` wrote, and removes any prov fetch refspec
+//! script, strips prov hook entries from adapter configs, unsets the git
+//! config keys `prov install` wrote, and removes any prov fetch refspec
 //! across all remotes. Notes ref and cache file are preserved unless
 //! `--purge` is passed (then `.git/prov.db` and `.git/prov-staging/` are
 //! deleted; the notes ref is intentionally left alone — local provenance
@@ -21,7 +21,10 @@ use serde_json::{Map, Value};
 use prov_core::git::Git;
 
 use super::common::CACHE_FILENAME;
-use super::install::{claude_settings_path, is_prov_owned_entry, HOOK_BLOCK_BEGIN, HOOK_BLOCK_END};
+use super::install::{
+    claude_settings_path, codex_config_path, codex_hooks_path, is_prov_owned_entry,
+    HOOK_BLOCK_BEGIN, HOOK_BLOCK_END,
+};
 
 #[derive(Parser, Debug)]
 pub struct Args {
@@ -45,6 +48,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
 
     uninstall_claude_settings(&git).context("removing prov entries from .claude/settings.json")?;
+    uninstall_codex_config(&git).context("removing prov entries from .codex config")?;
 
     unset_git_config(&git);
     remove_prov_fetch_refspecs(&git);
@@ -67,6 +71,64 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         println!("  cache + staging preserved (use `prov uninstall --purge` to delete)");
     }
     Ok(())
+}
+
+// -------- .codex config --------
+
+fn uninstall_codex_config(git: &Git) -> anyhow::Result<()> {
+    let hooks_path = codex_hooks_path(git);
+    if hooks_path.exists() {
+        let existing = fs::read_to_string(&hooks_path)
+            .with_context(|| format!("reading {}", hooks_path.display()))?;
+        let mut root: Map<String, Value> = serde_json::from_str(&existing)
+            .with_context(|| format!("{} is not valid JSON", hooks_path.display()))?;
+        let removed_any = strip_prov_entries(&mut root);
+        if removed_any && root.is_empty() {
+            fs::remove_file(&hooks_path)
+                .with_context(|| format!("removing {}", hooks_path.display()))?;
+        } else if removed_any {
+            fs::write(
+                &hooks_path,
+                serde_json::to_string_pretty(&Value::Object(root))? + "\n",
+            )
+            .with_context(|| format!("writing {}", hooks_path.display()))?;
+        }
+    }
+
+    let config_path = codex_config_path(git);
+    let existing = match fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", config_path.display())),
+    };
+    let cleaned = remove_codex_feature_flag(&existing);
+    if cleaned.trim().is_empty() {
+        fs::remove_file(&config_path)
+            .with_context(|| format!("removing {}", config_path.display()))?;
+    } else if cleaned != existing {
+        fs::write(&config_path, cleaned)
+            .with_context(|| format!("writing {}", config_path.display()))?;
+    }
+    Ok(())
+}
+
+fn remove_codex_feature_flag(src: &str) -> String {
+    let lines = src
+        .lines()
+        .filter(|line| line.trim() != "codex_hooks = true")
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if lines.iter().all(|line| {
+        let trimmed = line.trim();
+        trimmed.is_empty() || trimmed == "[features]"
+    }) {
+        return String::new();
+    }
+    let mut out = lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
 }
 
 // -------- hook --------

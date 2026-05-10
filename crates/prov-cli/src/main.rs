@@ -7,11 +7,11 @@ mod render;
 #[command(
     name = "prov",
     version,
-    about = "Prompt provenance for AI-generated code",
+    about = "Agent provenance for AI-generated code",
     long_about = "Prov captures the prompt-and-conversation context behind AI-generated code, \
-                  attaches it to commits via git notes, and exposes it to humans (CLI), agents \
-                  (Claude Code Skill), and reviewers (GitHub Action). Notes are local-only by \
-                  default; opt in to team sharing per-repo via `prov sync enable`."
+                  attaches it to commits via git notes, and exposes it through CLI and agent \
+                  read surfaces. Notes are local-only by default; opt in to team sharing \
+                  per-repo via `prov sync enable`."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -28,7 +28,7 @@ enum Command {
     PrTimeline(commands::pr_timeline::Args),
     /// Rebuild the `SQLite` cache from the notes ref.
     Reindex(commands::reindex::Args),
-    /// Install prov into the current repo (hooks, git config, plugin, optional sync enablement).
+    /// Install prov into the current repo (git hooks, git config, optional agent adapters).
     Install(commands::install::Args),
     /// Remove prov from the current repo.
     Uninstall(commands::uninstall::Args),
@@ -48,7 +48,7 @@ enum Command {
     Gc(commands::gc::Args),
     /// Best-effort historical capture from stored Claude Code session transcripts.
     Backfill(commands::backfill::Args),
-    /// Internal: hook-event dispatch (called by Claude Code hooks and git hooks).
+    /// Internal: hook-event dispatch (called by agent harness hooks and git hooks).
     #[command(hide = true)]
     Hook(commands::hook::Args),
 }

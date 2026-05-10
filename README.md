@@ -2,10 +2,10 @@
 
 > Git blame tells you who. Prov tells you why.
 
-Prov captures the prompt-and-conversation context behind every Claude-Code-driven edit, attaches it to commits via git notes, and exposes it through two thin surfaces:
+Prov captures the prompt-and-conversation context behind AI-agent-driven edits, attaches it to commits via git notes, and exposes it through thin read surfaces:
 
 - **CLI** for humans: `prov log src/auth.ts:42` returns the originating prompt for any line.
-- **Claude Code Skill** for agents: when Claude Code is asked to refactor a file it (or another Claude Code session) wrote weeks ago, the Skill teaches the agent to query its own prior reasoning before proposing edits.
+- **Agent skills and hooks** for supported harnesses: Claude Code and Codex can capture provenance today, and agents can query prior reasoning before proposing edits.
 
 ## Status
 
@@ -17,7 +17,7 @@ Prov is an open-source tool I'm building because I want it to exist. **It is not
 
 Other tools have shipped with similar core architecture: per-line AI authorship in git notes, SQLite cache, rewrite preservation, multi-agent attribution. Prov is not novel on storage. The honest differentiators are:
 
-- **Agent-first via the Claude Code Skill.** No equivalent surface today. Giving an agent access to its own prior reasoning is a different category of capability — not just better tooling for humans, but better continuity across sessions.
+- **Agent-first, harness-agnostic posture.** Giving an agent access to its own prior reasoning is a different category of capability — not just better tooling for humans, but better continuity across sessions and harnesses.
 - **Redactor-by-default-when-shared.** Notes are local-only out of the box; opting in to team sharing (`prov sync enable origin`) turns on a write-time secret-detector pipeline plus a pre-push gate. The redaction story matters when you choose to share.
 
 ## Install
@@ -34,15 +34,22 @@ Each release will be signed with [Sigstore cosign](https://www.sigstore.dev/) ke
 ## Quick start
 
 ```bash
-# In any git repo where you use Claude Code:
+# In any git repo, install shared git hooks/cache:
 prov install
-# (Restart Claude Code so it picks up the new hooks.)
 
-# Run a Claude Code session, make some edits, commit. Then:
+# Then explicitly wire the agent harnesses you use:
+prov install --agent claude
+prov install --agent codex
+# or: prov install --agent all
+
+# Restart/reopen the harness so it picks up repo-local hook config.
+# Run an agent session, make some edits, commit. Then:
 prov log src/auth.ts                 # see provenance for the whole file
 prov log src/auth.ts:42              # see the originating prompt for one line
 prov search "rate limiting"          # find prompts that mention rate limiting
 ```
+
+Codex project-local hooks require Codex to trust the repo's `.codex/` config layer before they run.
 
 By default, notes stay on your machine. To share with your team:
 

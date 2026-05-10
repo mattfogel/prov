@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "Stop",
+  "session_id": "codex_fixture001",
+  "turn_id": "turn_codex001",
+  "cwd": "/tmp/prov-fixture",
+  "model": "gpt-5.4-codex",
+  "stop_hook_active": false,
+  "last_assistant_message": null
+}

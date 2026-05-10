@@ -1,9 +1,10 @@
 //! In-flight session state held under `.git/prov-staging/`.
 //!
-//! Capture is a multi-process state machine: every Claude Code hook fires in
-//! its own short-lived `prov hook` invocation, accumulates one record into the
-//! staging tree, and exits. The post-commit hook walks the tree, matches
-//! staged edits against the commit's diff, and flushes matches into a note.
+//! Capture is a multi-process state machine: every supported agent harness
+//! fires its own short-lived `prov hook` invocation, accumulates one record
+//! into the staging tree, and exits. The post-commit hook walks the tree,
+//! matches staged edits against the commit's diff, and flushes matches into a
+//! note.
 //!
 //! Layout (`<git-dir>/prov-staging/`):
 //!
@@ -205,9 +206,9 @@ impl Staging {
     /// Append one edit record to `<session>/edits.jsonl`.
     ///
     /// JSONL is append-only by design: `O_APPEND` writes are atomic up to
-    /// `PIPE_BUF` on POSIX, so two concurrent Claude Code sessions writing to
-    /// different files do not interfere. Within one session we never have
-    /// concurrent writers (Claude Code's hook lifecycle serializes them).
+    /// `PIPE_BUF` on POSIX, so two concurrent agent sessions writing to
+    /// different files do not interfere. Within one session each harness
+    /// serializes hook lifecycle events.
     pub fn append_edit(
         &self,
         sid: &SessionId,
@@ -364,6 +365,9 @@ pub struct EditRecord {
     pub turn_index: u32,
     /// Tool that produced the edit (`Edit` | `Write` | `MultiEdit`).
     pub tool_name: String,
+    /// Agent harness that produced the edit (`claude-code`, `codex`, etc.).
+    #[serde(default = "default_edit_tool")]
+    pub tool: String,
     /// Per-tool-call correlation handle when the platform surfaces one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
@@ -387,6 +391,10 @@ pub struct EditRecord {
     pub model: Option<String>,
     /// ISO-8601 timestamp.
     pub timestamp: String,
+}
+
+fn default_edit_tool() -> String {
+    "claude-code".to_string()
 }
 
 /// `SessionStart` metadata.
@@ -547,6 +555,7 @@ mod tests {
             session_id: "sess_abc123".into(),
             turn_index: idx,
             tool_name: "Edit".into(),
+            tool: "claude-code".into(),
             tool_use_id: Some("toolu_x".into()),
             file: file.into(),
             line_range: [line_start, line_start],

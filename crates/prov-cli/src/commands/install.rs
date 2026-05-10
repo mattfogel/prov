@@ -6,7 +6,7 @@
 //!   `notes.mergeStrategy=manual` (U10 owns the resolver).
 //! - Installs `.git/hooks/post-commit` inside a `# >>> prov` / `# <<< prov`
 //!   delimiter block so prov composes with any user-authored hook content.
-//! - Adds prov's Claude Code hook entries to `.claude/settings.json`.
+//! - Optionally adds prov's agent-harness hook entries to repo-local adapter config.
 //! - Initializes `<git-dir>/prov.db` and runs an initial reindex.
 //!
 //! `--plugin` prints the Claude Code marketplace install command
@@ -25,7 +25,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde_json::{Map, Value};
 
 use prov_core::git::Git;
@@ -51,6 +51,9 @@ const POST_REWRITE_TEMPLATE: &str = include_str!("../../../../githooks/post-rewr
 /// plugin's hook entries into project-scope `.claude/settings.json`.
 const PLUGIN_HOOKS_JSON: &str = include_str!("../../../../plugin/hooks/hooks.json");
 
+/// Embedded Codex hook template. Source: `codex/hooks/hooks.json`.
+const CODEX_HOOKS_JSON: &str = include_str!("../../../../codex/hooks/hooks.json");
+
 /// Sentinel pair that scopes prov's chained content inside any shared hook.
 pub const HOOK_BLOCK_BEGIN: &str = "# >>> prov";
 /// End of the prov-managed block.
@@ -66,6 +69,23 @@ pub struct Args {
     /// the named remote). Defaults to local-only — sync is opt-in per-repo.
     #[arg(long, value_name = "REMOTE")]
     pub enable_push: Option<String>,
+    /// Agent adapter hooks to install into repo-local harness config.
+    /// Repeatable; use `--agent all` for every supported adapter.
+    #[arg(long = "agent", value_enum)]
+    pub agents: Vec<AgentSelection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AgentSelection {
+    Claude,
+    Codex,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentAdapter {
+    Claude,
+    Codex,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -94,7 +114,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     install_hook(&post_rewrite_path, POST_REWRITE_TEMPLATE)
         .with_context(|| format!("installing {}", post_rewrite_path.display()))?;
 
-    install_claude_settings(&git).context("merging prov entries into .claude/settings.json")?;
+    let adapters = selected_adapters(&args.agents);
+    if adapters.contains(&AgentAdapter::Claude) {
+        install_claude_settings(&git).context("merging prov entries into .claude/settings.json")?;
+    }
+    if adapters.contains(&AgentAdapter::Codex) {
+        install_codex_config(&git).context("merging prov entries into .codex config")?;
+    }
 
     if let Some(remote) = args.enable_push.as_deref() {
         configure_remote_refspec(&git, remote)
@@ -109,7 +135,18 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     println!("  hooks:    {}", pre_push_path.display());
     println!("  hooks:    {}", post_rewrite_path.display());
     println!("  cache:    {}", cache_path.display());
-    println!("  settings: {}", claude_settings_path(&git).display());
+    if adapters.is_empty() {
+        println!("  agents:   none (run `prov install --agent claude`, `--agent codex`, or `--agent all`)");
+    } else {
+        println!("  agents:   {}", adapters_label(&adapters));
+    }
+    if adapters.contains(&AgentAdapter::Claude) {
+        println!("  claude:   {}", claude_settings_path(&git).display());
+    }
+    if adapters.contains(&AgentAdapter::Codex) {
+        println!("  codex:    {}", codex_hooks_path(&git).display());
+        println!("  codex:    project hooks require Codex to trust this repo's `.codex/` config");
+    }
     if let Some(remote) = args.enable_push {
         println!(
             "  push:     fetch refspec configured for `{remote}` — pre-push secret gate active"
@@ -118,6 +155,35 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         println!("  push:     local-only (use `prov install --enable-push <remote>` to opt in)");
     }
     Ok(())
+}
+
+fn selected_adapters(selections: &[AgentSelection]) -> Vec<AgentAdapter> {
+    if selections.contains(&AgentSelection::All) {
+        return vec![AgentAdapter::Claude, AgentAdapter::Codex];
+    }
+    let mut adapters = Vec::new();
+    for selection in selections {
+        let adapter = match selection {
+            AgentSelection::Claude => AgentAdapter::Claude,
+            AgentSelection::Codex => AgentAdapter::Codex,
+            AgentSelection::All => unreachable!("handled above"),
+        };
+        if !adapters.contains(&adapter) {
+            adapters.push(adapter);
+        }
+    }
+    adapters
+}
+
+fn adapters_label(adapters: &[AgentAdapter]) -> String {
+    adapters
+        .iter()
+        .map(|adapter| match adapter {
+            AgentAdapter::Claude => "claude",
+            AgentAdapter::Codex => "codex",
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn print_plugin_instructions() {
@@ -300,6 +366,115 @@ fn install_claude_settings(git: &Git) -> anyhow::Result<()> {
 
     write_pretty_json(&path, &Value::Object(root))?;
     Ok(())
+}
+
+// -------- .codex config --------
+
+pub(crate) fn codex_hooks_path(git: &Git) -> PathBuf {
+    git.work_tree().join(".codex").join("hooks.json")
+}
+
+pub(crate) fn codex_config_path(git: &Git) -> PathBuf {
+    git.work_tree().join(".codex").join("config.toml")
+}
+
+fn install_codex_config(git: &Git) -> anyhow::Result<()> {
+    let hooks: Value = serde_json::from_str(CODEX_HOOKS_JSON)
+        .context("embedded codex hooks JSON failed to parse")?;
+    let hooks_obj = hooks
+        .get("hooks")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("embedded codex hooks JSON missing top-level `hooks` object"))?
+        .clone();
+    let hooks_path = codex_hooks_path(git);
+    if let Some(parent) = hooks_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut root: Map<String, Value> = match fs::read_to_string(&hooks_path) {
+        Ok(s) => serde_json::from_str(&s).with_context(|| {
+            format!(
+                "{} is not valid JSON; remove or fix it before running `prov install`",
+                hooks_path.display()
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Map::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", hooks_path.display())),
+    };
+    merge_hooks_object(&hooks_path, &mut root, &hooks_obj)?;
+    write_pretty_json(&hooks_path, &Value::Object(root))?;
+
+    let config_path = codex_config_path(git);
+    let updated = merge_codex_feature_flag(&config_path)?;
+    atomic_write(&config_path, updated.as_bytes())?;
+    Ok(())
+}
+
+fn merge_hooks_object(
+    path: &Path,
+    root: &mut Map<String, Value>,
+    plugin_hooks_obj: &Map<String, Value>,
+) -> anyhow::Result<()> {
+    let hooks_value = root
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let hooks_obj = hooks_value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("`hooks` in {} must be an object", path.display()))?;
+
+    for (event, plugin_entries) in plugin_hooks_obj {
+        let plugin_entries_arr = plugin_entries
+            .as_array()
+            .ok_or_else(|| anyhow!("hook event `{event}` must be a JSON array"))?;
+        let user_entries = hooks_obj
+            .entry(event.clone())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("`hooks.{event}` in {} must be an array", path.display()))?;
+        user_entries.retain(|entry| !is_prov_owned_entry(entry));
+        for entry in plugin_entries_arr {
+            user_entries.push(entry.clone());
+        }
+    }
+    Ok(())
+}
+
+fn merge_codex_feature_flag(path: &Path) -> anyhow::Result<String> {
+    let existing = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    if existing
+        .lines()
+        .any(|line| line.trim() == "codex_hooks = true")
+    {
+        return Ok(ensure_trailing_newline(existing));
+    }
+    let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
+    if let Some(features_idx) = lines.iter().position(|line| line.trim() == "[features]") {
+        let insert_at = lines[features_idx + 1..]
+            .iter()
+            .position(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with('[') && trimmed.ends_with(']')
+            })
+            .map_or(lines.len(), |relative| features_idx + 1 + relative);
+        lines.insert(insert_at, "codex_hooks = true".to_string());
+        return Ok(ensure_trailing_newline(lines.join("\n")));
+    }
+    if !lines.is_empty() && !lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.push(String::new());
+    }
+    lines.push("[features]".to_string());
+    lines.push("codex_hooks = true".to_string());
+    Ok(ensure_trailing_newline(lines.join("\n")))
+}
+
+fn ensure_trailing_newline(mut s: String) -> String {
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
+    s
 }
 
 /// True if the settings.json hook-entry block is owned by prov, in either the

@@ -469,6 +469,7 @@ fn cherry_pick_stamps_derived_from_via_post_commit() {
                 turn_index: 0,
                 tool_use_id: Some("toolu_cp".into()),
                 tool_name: "Write".into(),
+                tool: "claude-code".into(),
                 file: "PICKED.md".into(),
                 line_range: [1, 1],
                 before: String::new(),

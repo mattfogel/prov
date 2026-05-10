@@ -1,6 +1,6 @@
 //! Hook-event dispatch.
 //!
-//! Called by Claude Code hooks (`UserPromptSubmit`, `PostToolUse`, `Stop`,
+//! Called by agent harness hooks (`UserPromptSubmit`, `PostToolUse`, `Stop`,
 //! `SessionStart`) and by git hooks (`post-commit`, `post-rewrite`, `pre-push`).
 //!
 //! **Defensive contract.** All hook subcommands always exit `0` — even on
@@ -9,17 +9,14 @@
 //! that intentionally block (e.g., U8's pre-push gate when an unredacted
 //! secret is detected) live in dedicated handlers, not here.
 //!
-//! Each handler reads its hook payload from stdin (Claude Code's hook
+//! Each handler reads its hook payload from stdin (the harness hook
 //! contract) and runs `Redactor::redact` over any prompt-or-summary text
 //! before staging. Even local-only staging is scrubbed: a future opt-in
 //! `prov push` should never find raw secrets in the staging tree.
 //!
-//! The parsers below operate on the documented `tool_input` envelope
-//! (Edit/Write/MultiEdit shapes per the Claude Code tool docs). Live-session
-//! payloads were diffed against the fixtures and matched; the
-//! `tool_response.structuredPatch` shape is still unparsed in v1 (we don't
-//! need it — `tool_input` carries enough), so its undocumented status doesn't
-//! gate capture today.
+//! The Claude parser operates on the documented `tool_input` envelope
+//! (Edit/Write/MultiEdit shapes). The Codex parser starts with `apply_patch`
+//! command payloads, matching Codex's documented file-edit hook surface.
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -41,6 +38,9 @@ use prov_core::storage::{NOTES_REF_PRIVATE, NOTES_REF_PUBLIC};
 use super::common::CACHE_FILENAME;
 use prov_core::time::now_iso8601;
 
+const TOOL_CLAUDE_CODE: &str = "claude-code";
+const TOOL_CODEX: &str = "codex";
+
 #[derive(Parser, Debug)]
 pub struct Args {
     #[command(subcommand)]
@@ -57,6 +57,16 @@ pub enum Event {
     Stop,
     /// Claude Code: `SessionStart` — capture model name for this session.
     SessionStart,
+    /// Claude Code hook event with explicit adapter selection.
+    Claude {
+        #[command(subcommand)]
+        event: AgentEvent,
+    },
+    /// Codex hook event with explicit adapter selection.
+    Codex {
+        #[command(subcommand)]
+        event: AgentEvent,
+    },
     /// Git: `post-commit` — flush staged edits into a note attached to HEAD.
     PostCommit,
     /// Git: `post-rewrite` — reattach notes after amend/rebase/squash.
@@ -66,6 +76,33 @@ pub enum Event {
     },
     /// Git: `pre-push` — scan notes refs for unredacted secrets before push. Owned by U8.
     PrePush,
+}
+
+#[derive(Subcommand, Debug, Clone, Copy)]
+pub enum AgentEvent {
+    /// `UserPromptSubmit` — stage prompt + session metadata.
+    UserPromptSubmit,
+    /// `PostToolUse` — stage file edits.
+    PostToolUse,
+    /// `Stop` — mark the current turn complete.
+    Stop,
+    /// `SessionStart` — capture model name for this session.
+    SessionStart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentHarness {
+    Claude,
+    Codex,
+}
+
+impl AgentHarness {
+    fn tool(self) -> &'static str {
+        match self {
+            Self::Claude => TOOL_CLAUDE_CODE,
+            Self::Codex => TOOL_CODEX,
+        }
+    }
 }
 
 /// Defensive entry point. Every error path here logs and exits 0 — the run
@@ -92,10 +129,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let event_label = format!("{:?}", args.event);
     let result = match args.event {
-        Event::UserPromptSubmit => handle_user_prompt_submit(&staging),
-        Event::PostToolUse => handle_post_tool_use(&staging, Some(git.work_tree())),
-        Event::Stop => handle_stop(&staging),
-        Event::SessionStart => handle_session_start(&staging),
+        Event::UserPromptSubmit => handle_user_prompt_submit(&staging, AgentHarness::Claude),
+        Event::PostToolUse => {
+            handle_post_tool_use(&staging, AgentHarness::Claude, Some(git.work_tree()))
+        }
+        Event::Stop => handle_stop(&staging, AgentHarness::Claude),
+        Event::SessionStart => handle_session_start(&staging, AgentHarness::Claude),
+        Event::Claude { event } => handle_agent_event(&staging, AgentHarness::Claude, event, &git),
+        Event::Codex { event } => handle_agent_event(&staging, AgentHarness::Codex, event, &git),
         Event::PostCommit => handle_post_commit(&git, &staging),
         Event::PostRewrite { kind } => handle_post_rewrite(&git, &staging, &kind),
         Event::PrePush => unreachable!("pre-push routed above"),
@@ -108,6 +149,20 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn handle_agent_event(
+    staging: &Staging,
+    harness: AgentHarness,
+    event: AgentEvent,
+    git: &Git,
+) -> Result<(), HandlerError> {
+    match event {
+        AgentEvent::UserPromptSubmit => handle_user_prompt_submit(staging, harness),
+        AgentEvent::PostToolUse => handle_post_tool_use(staging, harness, Some(git.work_tree())),
+        AgentEvent::Stop => handle_stop(staging, harness),
+        AgentEvent::SessionStart => handle_session_start(staging, harness),
+    }
 }
 
 /// Pre-push wrapper. Translates the handler's `PrePushOutcome` into either
@@ -143,6 +198,8 @@ struct UserPromptSubmitPayload {
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
+    turn_id: Option<String>,
+    #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
@@ -150,9 +207,15 @@ struct UserPromptSubmitPayload {
     transcript_path: Option<String>,
 }
 
-fn handle_user_prompt_submit(staging: &Staging) -> Result<(), HandlerError> {
+fn handle_user_prompt_submit(
+    staging: &Staging,
+    _harness: AgentHarness,
+) -> Result<(), HandlerError> {
     let payload: UserPromptSubmitPayload = read_stdin_json()?;
-    let raw_session = payload.session_id.unwrap_or_default();
+    let raw_session = payload
+        .session_id
+        .or_else(|| payload.turn_id.clone())
+        .unwrap_or_default();
     let prompt = payload.prompt.unwrap_or_default();
     let Ok(sid) = SessionId::parse(raw_session) else {
         return Ok(());
@@ -193,6 +256,8 @@ struct PostToolUsePayload {
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
+    turn_id: Option<String>,
+    #[serde(default)]
     tool_name: Option<String>,
     #[serde(default)]
     tool_use_id: Option<String>,
@@ -206,16 +271,30 @@ struct PostToolUsePayload {
     /// SessionStart model — `/model` does not re-fire SessionStart.
     #[serde(default)]
     transcript_path: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
-fn handle_post_tool_use(staging: &Staging, work_tree: Option<&Path>) -> Result<(), HandlerError> {
+fn handle_post_tool_use(
+    staging: &Staging,
+    harness: AgentHarness,
+    work_tree: Option<&Path>,
+) -> Result<(), HandlerError> {
     let payload: PostToolUsePayload = read_stdin_json()?;
-    let raw_session = payload.session_id.unwrap_or_default();
+    let raw_session = payload
+        .session_id
+        .or_else(|| payload.turn_id.clone())
+        .unwrap_or_default();
     let Ok(sid) = SessionId::parse(raw_session) else {
         return Ok(());
     };
     let tool_name = payload.tool_name.unwrap_or_default();
-    if !matches!(tool_name.as_str(), "Edit" | "Write" | "MultiEdit") {
+    if harness == AgentHarness::Claude
+        && !matches!(tool_name.as_str(), "Edit" | "Write" | "MultiEdit")
+    {
+        return Ok(());
+    }
+    if harness == AgentHarness::Codex && tool_name != "apply_patch" {
         return Ok(());
     }
 
@@ -232,10 +311,12 @@ fn handle_post_tool_use(staging: &Staging, work_tree: Option<&Path>) -> Result<(
     let model = payload
         .transcript_path
         .as_deref()
-        .and_then(read_latest_assistant_model);
+        .and_then(read_latest_assistant_model)
+        .or(payload.model);
 
     let edits = decompose_tool_use(
         &tool_name,
+        harness,
         &payload.tool_input,
         &payload.tool_response,
         &sid,
@@ -315,6 +396,7 @@ fn most_recent_turn_started_at(
 #[allow(clippy::too_many_arguments)]
 fn decompose_tool_use(
     tool_name: &str,
+    harness: AgentHarness,
     tool_input: &serde_json::Value,
     _tool_response: &serde_json::Value,
     sid: &SessionId,
@@ -324,8 +406,8 @@ fn decompose_tool_use(
     work_tree: Option<&Path>,
 ) -> Vec<EditRecord> {
     let timestamp = now_iso8601();
-    match tool_name {
-        "Edit" => {
+    match (harness, tool_name) {
+        (AgentHarness::Claude, "Edit") => {
             let Some(file) = tool_input.get("file_path").and_then(|v| v.as_str()) else {
                 return Vec::new();
             };
@@ -341,6 +423,7 @@ fn decompose_tool_use(
                 sid,
                 turn_index,
                 tool_name,
+                harness.tool(),
                 tool_use_id,
                 model,
                 file,
@@ -350,7 +433,7 @@ fn decompose_tool_use(
                 work_tree,
             )]
         }
-        "Write" => {
+        (AgentHarness::Claude, "Write") => {
             let Some(file) = tool_input.get("file_path").and_then(|v| v.as_str()) else {
                 return Vec::new();
             };
@@ -362,6 +445,7 @@ fn decompose_tool_use(
                 sid,
                 turn_index,
                 tool_name,
+                harness.tool(),
                 tool_use_id,
                 model,
                 file,
@@ -371,7 +455,7 @@ fn decompose_tool_use(
                 work_tree,
             )]
         }
-        "MultiEdit" => {
+        (AgentHarness::Claude, "MultiEdit") => {
             let Some(file) = tool_input.get("file_path").and_then(|v| v.as_str()) else {
                 return Vec::new();
             };
@@ -387,6 +471,7 @@ fn decompose_tool_use(
                         sid,
                         turn_index,
                         tool_name,
+                        harness.tool(),
                         tool_use_id,
                         model,
                         file,
@@ -398,8 +483,90 @@ fn decompose_tool_use(
                 })
                 .collect()
         }
+        (AgentHarness::Codex, "apply_patch") => decompose_apply_patch_tool_use(
+            tool_input,
+            sid,
+            turn_index,
+            tool_use_id,
+            model,
+            &timestamp,
+            work_tree,
+        ),
         _ => Vec::new(),
     }
+}
+
+fn decompose_apply_patch_tool_use(
+    tool_input: &serde_json::Value,
+    sid: &SessionId,
+    turn_index: u32,
+    tool_use_id: Option<&str>,
+    model: Option<&str>,
+    timestamp: &str,
+    work_tree: Option<&Path>,
+) -> Vec<EditRecord> {
+    let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
+    parse_apply_patch_command(command)
+        .into_iter()
+        .map(|patch| {
+            record_for(
+                sid,
+                turn_index,
+                "apply_patch",
+                TOOL_CODEX,
+                tool_use_id,
+                model,
+                &patch.file,
+                "",
+                &patch.added_lines.join("\n"),
+                timestamp,
+                work_tree,
+            )
+        })
+        .collect()
+}
+
+struct ParsedPatchFile {
+    file: String,
+    added_lines: Vec<String>,
+}
+
+fn parse_apply_patch_command(command: &str) -> Vec<ParsedPatchFile> {
+    let mut files = Vec::new();
+    let mut current: Option<ParsedPatchFile> = None;
+    for line in command.lines() {
+        if let Some(file) = line
+            .strip_prefix("*** Update File: ")
+            .or_else(|| line.strip_prefix("*** Add File: "))
+        {
+            if let Some(done) = current.take() {
+                if !done.added_lines.is_empty() {
+                    files.push(done);
+                }
+            }
+            current = Some(ParsedPatchFile {
+                file: file.trim().to_string(),
+                added_lines: Vec::new(),
+            });
+            continue;
+        }
+        if line.starts_with("*** ") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('+') {
+            if let Some(active) = current.as_mut() {
+                active.added_lines.push(rest.to_string());
+            }
+        }
+    }
+    if let Some(done) = current {
+        if !done.added_lines.is_empty() {
+            files.push(done);
+        }
+    }
+    files
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -407,6 +574,7 @@ fn record_for(
     sid: &SessionId,
     turn_index: u32,
     tool_name: &str,
+    tool: &str,
     tool_use_id: Option<&str>,
     model: Option<&str>,
     file: &str,
@@ -429,6 +597,7 @@ fn record_for(
         session_id: sid.as_str().to_string(),
         turn_index,
         tool_name: tool_name.to_string(),
+        tool: tool.to_string(),
         tool_use_id: tool_use_id.map(str::to_string),
         file: relativize_for_storage(file, work_tree),
         line_range,
@@ -532,11 +701,18 @@ fn relativize_for_storage(file: &str, work_tree: Option<&Path>) -> String {
 struct StopPayload {
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    turn_id: Option<String>,
 }
 
-fn handle_stop(staging: &Staging) -> Result<(), HandlerError> {
+fn handle_stop(staging: &Staging, _harness: AgentHarness) -> Result<(), HandlerError> {
     let payload: StopPayload = read_stdin_json()?;
-    let Ok(sid) = SessionId::parse(payload.session_id.unwrap_or_default()) else {
+    let Ok(sid) = SessionId::parse(
+        payload
+            .session_id
+            .or_else(|| payload.turn_id.clone())
+            .unwrap_or_default(),
+    ) else {
         return Ok(());
     };
     finalize_last_turn(staging, &sid, false);
@@ -567,12 +743,19 @@ struct SessionStartPayload {
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
+    turn_id: Option<String>,
+    #[serde(default)]
     model: Option<String>,
 }
 
-fn handle_session_start(staging: &Staging) -> Result<(), HandlerError> {
+fn handle_session_start(staging: &Staging, _harness: AgentHarness) -> Result<(), HandlerError> {
     let payload: SessionStartPayload = read_stdin_json()?;
-    let Ok(sid) = SessionId::parse(payload.session_id.unwrap_or_default()) else {
+    let Ok(sid) = SessionId::parse(
+        payload
+            .session_id
+            .or_else(|| payload.turn_id.clone())
+            .unwrap_or_default(),
+    ) else {
         return Ok(());
     };
     let model = payload.model.unwrap_or_else(|| "unknown".to_string());
@@ -723,7 +906,7 @@ fn flush_visibility(
                 tool_use_id: er.tool_use_id.clone(),
                 preceding_turns_summary: None,
                 model,
-                tool: "claude-code".into(),
+                tool: er.tool.clone(),
                 timestamp: er.timestamp.clone(),
                 derived_from: None,
             };
@@ -1493,6 +1676,7 @@ mod tests {
         });
         let recs = decompose_tool_use(
             "Edit",
+            AgentHarness::Claude,
             &input,
             &serde_json::Value::Null,
             &sid,
@@ -1520,6 +1704,7 @@ mod tests {
         });
         let recs = decompose_tool_use(
             "Edit",
+            AgentHarness::Claude,
             &input,
             &serde_json::Value::Null,
             &sid,
@@ -1547,6 +1732,7 @@ mod tests {
         });
         let recs = decompose_tool_use(
             "Edit",
+            AgentHarness::Claude,
             &input,
             &serde_json::Value::Null,
             &sid,
@@ -1572,6 +1758,7 @@ mod tests {
         });
         let recs = decompose_tool_use(
             "Write",
+            AgentHarness::Claude,
             &input,
             &serde_json::Value::Null,
             &sid,
@@ -1597,6 +1784,7 @@ mod tests {
         });
         let recs = decompose_tool_use(
             "MultiEdit",
+            AgentHarness::Claude,
             &input,
             &serde_json::Value::Null,
             &sid,
@@ -1620,6 +1808,7 @@ mod tests {
         let sid = SessionId::parse("sess_t").unwrap();
         let recs = decompose_tool_use(
             "SomethingElse",
+            AgentHarness::Claude,
             &serde_json::Value::Null,
             &serde_json::Value::Null,
             &sid,
@@ -1657,6 +1846,7 @@ mod tests {
             session_id: "s".into(),
             turn_index: 0,
             tool_name: "Write".into(),
+            tool: TOOL_CLAUDE_CODE.into(),
             tool_use_id: None,
             file: "/tmp/repo/src/lib.rs".into(),
             line_range: [1, 2],
