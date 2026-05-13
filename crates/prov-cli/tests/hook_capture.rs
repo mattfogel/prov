@@ -49,6 +49,17 @@ fn fire_hook(cwd: &Path, event: &str, payload: &str) {
         .success();
 }
 
+fn fire_agent_hook(cwd: &Path, agent: &str, event: &str, payload: &str) {
+    prov()
+        .current_dir(cwd)
+        .args(["hook", agent, event])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .write_stdin(payload)
+        .assert()
+        .success();
+}
+
 fn fire_post_rewrite(cwd: &Path, kind: &str, payload: &str) {
     prov()
         .current_dir(cwd)
@@ -93,6 +104,41 @@ fn user_prompt_submit_creates_turn_file() {
     assert!(body.contains("\"turn_index\": 0"));
     assert!(body.contains("\"private\": false"));
     assert!(body.contains("hello function"));
+}
+
+#[test]
+fn adapter_qualified_claude_prompt_matches_legacy_prompt_capture() {
+    let tmp = init_repo();
+    fire_agent_hook(
+        tmp.path(),
+        "claude",
+        "user-prompt-submit",
+        &read_fixture("user-prompt-submit.json"),
+    );
+
+    let turn_path = staging_path(tmp.path()).join(SID).join("turn-0.json");
+    assert!(turn_path.exists(), "turn-0.json not written");
+    let body = std::fs::read_to_string(turn_path).unwrap();
+    assert!(body.contains("hello function"));
+}
+
+#[test]
+fn codex_user_prompt_submit_creates_turn_file() {
+    let tmp = init_repo();
+    fire_agent_hook(
+        tmp.path(),
+        "codex",
+        "user-prompt-submit",
+        &read_fixture("codex-user-prompt-submit.json"),
+    );
+
+    let turn_path = staging_path(tmp.path())
+        .join("codex_fixture001")
+        .join("turn-0.json");
+    assert!(turn_path.exists(), "codex turn-0.json not written");
+    let body = std::fs::read_to_string(turn_path).unwrap();
+    assert!(body.contains("\"turn_index\": 0"));
+    assert!(body.contains("add a hello function from Codex"));
 }
 
 #[test]
@@ -279,6 +325,74 @@ fn end_to_end_capture_writes_note_to_head_on_post_commit() {
         body.contains("\"file\": \"src/lib.rs\""),
         "note missing file: {body}"
     );
+}
+
+#[test]
+fn codex_end_to_end_capture_writes_note_with_codex_tool() {
+    let tmp = init_repo();
+    let root = tmp.path();
+
+    fire_agent_hook(
+        root,
+        "codex",
+        "session-start",
+        &read_fixture("codex-session-start.json"),
+    );
+    fire_agent_hook(
+        root,
+        "codex",
+        "user-prompt-submit",
+        &read_fixture("codex-user-prompt-submit.json"),
+    );
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn hello() -> &'static str {\n    \"hello, codex\"\n}\n",
+    )
+    .unwrap();
+
+    fire_agent_hook(
+        root,
+        "codex",
+        "post-tool-use",
+        &read_fixture("codex-post-tool-use-apply-patch.json"),
+    );
+    fire_agent_hook(root, "codex", "stop", &read_fixture("codex-stop.json"));
+
+    run_git(root, &["add", "src/lib.rs"]);
+    run_git(root, &["commit", "-q", "-m", "feat: hello"]);
+    fire_hook(root, "post-commit", "");
+
+    let head = String::from_utf8(
+        Command::new("git")
+            .current_dir(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let show = Command::new("git")
+        .current_dir(root)
+        .args(["notes", "--ref", "refs/notes/prompts", "show", &head])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(
+        show.status.success(),
+        "no note attached to HEAD: stderr={}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let body = String::from_utf8(show.stdout).unwrap();
+    assert!(body.contains("add a hello function from Codex"));
+    assert!(body.contains("\"file\": \"src/lib.rs\""));
+    assert!(body.contains("\"tool\": \"codex\""));
+    assert!(body.contains("\"model\": \"gpt-5.4-codex\""));
 }
 
 #[test]

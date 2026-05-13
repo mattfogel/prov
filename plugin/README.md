@@ -43,7 +43,7 @@ repo where the binary is on `PATH`.
 If you don't want a global plugin install, run this inside each repo you care about:
 
 ```bash
-prov install
+prov install --agent claude
 ```
 
 `prov install` is idempotent. It writes:
@@ -54,8 +54,9 @@ prov install
   Claude Code settings — same hook list as the marketplace install).
 - `.git/prov.db` (SQLite read cache).
 
-Re-run `prov install` after pulling a prov upgrade; it self-heals legacy entries and
-reports "already installed" without duplicating config.
+Run plain `prov install` when you only want shared git hooks/cache and no agent
+adapter config. Re-run `prov install --agent claude` after pulling a prov upgrade;
+it self-heals legacy entries and reports installed adapters without duplicating config.
 
 ## Verify it's working
 

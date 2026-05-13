@@ -83,7 +83,7 @@ fn make_edit(file: &str, prompt: &str, start: u32, hashes: Vec<String>) -> Edit 
 // ---------------- install / uninstall ----------------
 
 #[test]
-fn install_in_fresh_repo_writes_hooks_settings_and_cache() {
+fn install_in_fresh_repo_writes_shared_hooks_and_cache_without_agent_config() {
     let tmp = init_repo();
 
     prov_in(tmp.path()).arg("install").assert().success();
@@ -99,6 +99,32 @@ fn install_in_fresh_repo_writes_hooks_settings_and_cache() {
     assert!(pre_push.contains("# >>> prov"));
     assert!(pre_push.contains("prov hook pre-push"));
     assert!(pre_push.contains("# <<< prov"));
+
+    assert!(!tmp.path().join(".claude/settings.json").exists());
+    assert!(!tmp.path().join(".codex/hooks.json").exists());
+
+    // git config keys are set.
+    assert_eq!(
+        git_capture(tmp.path(), &["config", "--local", "notes.displayRef"]).trim(),
+        "refs/notes/prompts"
+    );
+    assert_eq!(
+        git_capture(tmp.path(), &["config", "--local", "notes.mergeStrategy"]).trim(),
+        "manual"
+    );
+
+    // SQLite cache was created.
+    assert!(tmp.path().join(".git/prov.db").exists());
+}
+
+#[test]
+fn install_agent_claude_writes_claude_settings() {
+    let tmp = init_repo();
+
+    prov_in(tmp.path())
+        .args(["install", "--agent", "claude"])
+        .assert()
+        .success();
 
     // .claude/settings.json contains all four hook events, each emitted in
     // Claude Code's required entry shape: `{ matcher?, hooks: [{type, command,
@@ -137,28 +163,133 @@ fn install_in_fresh_repo_writes_hooks_settings_and_cache() {
             .starts_with("prov hook"));
     }
 
-    // git config keys are set.
-    assert_eq!(
-        git_capture(tmp.path(), &["config", "--local", "notes.displayRef"]).trim(),
-        "refs/notes/prompts"
-    );
-    assert_eq!(
-        git_capture(tmp.path(), &["config", "--local", "notes.mergeStrategy"]).trim(),
-        "manual"
-    );
+    assert!(!tmp.path().join(".codex/hooks.json").exists());
+}
 
-    // SQLite cache was created.
-    assert!(tmp.path().join(".git/prov.db").exists());
+#[test]
+fn install_agent_codex_writes_codex_config_only() {
+    let tmp = init_repo();
+
+    prov_in(tmp.path())
+        .args(["install", "--agent", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "project hooks require Codex to trust",
+        ));
+
+    assert!(!tmp.path().join(".claude/settings.json").exists());
+    let hooks = std::fs::read_to_string(tmp.path().join(".codex/hooks.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&hooks).unwrap();
+    assert_eq!(
+        v["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+        "prov hook codex post-tool-use"
+    );
+    assert_eq!(v["hooks"]["PostToolUse"][0]["matcher"], "Edit|Write");
+
+    let config = std::fs::read_to_string(tmp.path().join(".codex/config.toml")).unwrap();
+    assert!(config.contains("[features]"));
+    assert!(config.contains("hooks = true"));
+    assert!(!config.contains("codex_hooks = true"));
+}
+
+#[test]
+fn install_agent_all_writes_claude_and_codex_config() {
+    let tmp = init_repo();
+
+    prov_in(tmp.path())
+        .args(["install", "--agent", "all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("agents:   claude, codex"));
+
+    assert!(tmp.path().join(".claude/settings.json").exists());
+    assert!(tmp.path().join(".codex/hooks.json").exists());
+    assert!(tmp.path().join(".codex/config.toml").exists());
+}
+
+#[test]
+fn install_preserves_user_codex_config_keys_and_hooks() {
+    let tmp = init_repo();
+    let codex_dir = tmp.path().join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(
+        codex_dir.join("config.toml"),
+        "model = \"gpt-5.4-codex\"\n\n[features]\nother = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        codex_dir.join("hooks.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo user"}]}]}}"#,
+    )
+    .unwrap();
+
+    prov_in(tmp.path())
+        .args(["install", "--agent", "codex"])
+        .assert()
+        .success();
+
+    let config = std::fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+    assert!(config.contains("model = \"gpt-5.4-codex\""));
+    assert!(config.contains("other = true"));
+    assert!(config.contains("hooks = true"));
+    assert!(!config.contains("codex_hooks = true"));
+
+    let raw = std::fs::read_to_string(codex_dir.join("hooks.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let stop_arr = v["hooks"]["Stop"].as_array().unwrap();
+    let commands = |e: &serde_json::Value| -> Vec<String> {
+        e["hooks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|h| h["command"].as_str().map(str::to_owned))
+            .collect()
+    };
+    assert!(stop_arr
+        .iter()
+        .any(|e| commands(e).iter().any(|c| c == "echo user")));
+    assert!(stop_arr
+        .iter()
+        .any(|e| commands(e).iter().any(|c| c == "prov hook codex stop")));
+}
+
+#[test]
+fn install_agent_codex_migrates_deprecated_feature_flag() {
+    let tmp = init_repo();
+    let codex_dir = tmp.path().join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(
+        codex_dir.join("config.toml"),
+        "model = \"gpt-5.4-codex\"\n\n[features]\ncodex_hooks = true\n",
+    )
+    .unwrap();
+
+    prov_in(tmp.path())
+        .args(["install", "--agent", "codex"])
+        .assert()
+        .success();
+
+    let config = std::fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+    assert!(config.contains("model = \"gpt-5.4-codex\""));
+    assert!(config.contains("hooks = true"));
+    assert!(!config.contains("codex_hooks = true"));
 }
 
 #[test]
 fn install_is_idempotent() {
     let tmp = init_repo();
-    prov_in(tmp.path()).arg("install").assert().success();
+    prov_in(tmp.path())
+        .args(["install", "--agent", "claude"])
+        .assert()
+        .success();
     let first_hook = std::fs::read_to_string(tmp.path().join(".git/hooks/post-commit")).unwrap();
     let first_settings = std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
 
-    prov_in(tmp.path()).arg("install").assert().success();
+    prov_in(tmp.path())
+        .args(["install", "--agent", "claude"])
+        .assert()
+        .success();
     let second_hook = std::fs::read_to_string(tmp.path().join(".git/hooks/post-commit")).unwrap();
     let second_settings =
         std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
@@ -179,7 +310,10 @@ fn install_preserves_user_hook_content() {
     std::fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
     std::fs::write(&hook_path, "#!/bin/sh\necho user-original-hook\n").unwrap();
 
-    prov_in(tmp.path()).arg("install").assert().success();
+    prov_in(tmp.path())
+        .args(["install", "--agent", "claude"])
+        .assert()
+        .success();
 
     let hook = std::fs::read_to_string(&hook_path).unwrap();
     assert!(hook.contains("echo user-original-hook"));
@@ -201,7 +335,10 @@ fn install_preserves_user_claude_settings_keys() {
     )
     .unwrap();
 
-    prov_in(tmp.path()).arg("install").assert().success();
+    prov_in(tmp.path())
+        .args(["install", "--agent", "claude"])
+        .assert()
+        .success();
 
     let raw = std::fs::read_to_string(&settings_path).unwrap();
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -238,7 +375,10 @@ fn install_heals_legacy_top_level_command_shape() {
     )
     .unwrap();
 
-    prov_in(tmp.path()).arg("install").assert().success();
+    prov_in(tmp.path())
+        .args(["install", "--agent", "claude"])
+        .assert()
+        .success();
 
     let raw = std::fs::read_to_string(&settings_path).unwrap();
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -266,6 +406,7 @@ fn install_plugin_flag_does_not_touch_repo() {
 
     assert!(!tmp.path().join(".git/hooks/post-commit").exists());
     assert!(!tmp.path().join(".claude/settings.json").exists());
+    assert!(!tmp.path().join(".codex/hooks.json").exists());
 }
 
 #[test]
@@ -334,6 +475,39 @@ fn uninstall_round_trips_install() {
         .status()
         .unwrap();
     assert!(!display_ref.success());
+}
+
+#[test]
+fn uninstall_removes_codex_config_but_preserves_user_content() {
+    let tmp = init_repo();
+    let codex_dir = tmp.path().join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(
+        codex_dir.join("config.toml"),
+        "model = \"gpt-5.4-codex\"\n\n[features]\nother = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        codex_dir.join("hooks.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo user"}]}]}}"#,
+    )
+    .unwrap();
+
+    prov_in(tmp.path())
+        .args(["install", "--agent", "codex"])
+        .assert()
+        .success();
+    prov_in(tmp.path()).arg("uninstall").assert().success();
+
+    let config = std::fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+    assert!(config.contains("model = \"gpt-5.4-codex\""));
+    assert!(config.contains("other = true"));
+    assert!(!config.contains("codex_hooks = true"));
+    assert!(!config.contains("hooks = true"));
+
+    let raw = std::fs::read_to_string(codex_dir.join("hooks.json")).unwrap();
+    assert!(raw.contains("echo user"));
+    assert!(!raw.contains("prov hook codex"));
 }
 
 #[test]

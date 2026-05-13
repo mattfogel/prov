@@ -1,0 +1,13 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "codex_fixture001",
+  "turn_id": "turn_codex001",
+  "cwd": "/tmp/prov-fixture",
+  "model": "gpt-5.4-codex",
+  "tool_name": "apply_patch",
+  "tool_use_id": "call_codex_patch001",
+  "tool_input": {
+    "command": "*** Begin Patch\n*** Add File: src/lib.rs\n+pub fn hello() -> &'static str {\n+    \"hello, codex\"\n+}\n*** End Patch\n"
+  },
+  "tool_response": {}
+}

@@ -64,7 +64,7 @@ impl Note {
     }
 }
 
-/// One edit produced by a single Claude Code tool-use within one turn.
+/// One edit produced by a single agent harness tool-use within one turn.
 ///
 /// `MultiEdit` tool calls decompose into one `Edit` per inner edit so each carries
 /// its own `tool_use_id` correlation handle (where available).
@@ -87,12 +87,12 @@ pub struct Edit {
     pub original_blob_sha: Option<String>,
     /// The user prompt that produced this edit (post-redaction).
     pub prompt: String,
-    /// Stable Claude Code session id for the conversation this edit came from.
+    /// Stable agent harness session id for the conversation this edit came from.
     pub conversation_id: String,
     /// Zero-based turn index within the conversation. Pairs with `conversation_id`
     /// as the deduplication key for notes-merge resolution (U10).
     pub turn_index: u32,
-    /// Per-tool-call correlation handle, when Claude Code surfaces it. Falls back
+    /// Per-tool-call correlation handle, when the harness surfaces it. Falls back
     /// to `None` if the platform did not provide a stable id for this edit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
@@ -103,9 +103,9 @@ pub struct Edit {
     /// treats identically to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preceding_turns_summary: Option<String>,
-    /// Model name as captured at session start (e.g., "claude-sonnet-4-5").
+    /// Model name as captured at session start or edit time.
     pub model: String,
-    /// Tool that produced the edit; "claude-code" in v1.
+    /// Agent harness that produced the edit, such as "claude-code" or "codex".
     pub tool: String,
     /// ISO-8601 timestamp at edit time (turn boundary if a single turn made many edits).
     pub timestamp: String,
@@ -337,5 +337,16 @@ mod tests {
         let n = Note::from_json(json).unwrap();
         assert!(n.edits[0].original_blob_sha.is_none());
         assert!(n.edits[0].preceding_turns_summary.is_none());
+    }
+
+    #[test]
+    fn non_claude_tool_value_roundtrips() {
+        let mut edit = sample_edit();
+        edit.tool = "codex".into();
+        let note = Note::new(vec![edit.clone()]);
+        let json = note.to_json().expect("serialize");
+        let parsed = Note::from_json(&json).expect("parse");
+        assert_eq!(parsed.edits[0].tool, "codex");
+        assert_eq!(parsed.edits[0], edit);
     }
 }

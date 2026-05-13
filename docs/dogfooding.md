@@ -5,13 +5,11 @@ suite has caught regressions on at least once. Use this when validating a
 release candidate, after a refactor that touches a hot path, or when you
 just want to feel the surface from a user's seat.
 
-The capture flow is exercised two ways. Section 2 drives a **real Claude
-Code session** end-to-end — the only way to prove that what the agent
-actually emits matches what `prov hook ...` actually consumes. Section 3
-drives the same hook handlers with hand-crafted JSON for everything you
-can't easily reproduce in a real session (malformed payloads, stale
-staging dirs, specific edge regexes). Run both — they're complementary,
-not redundant.
+The capture flow should be exercised first through **real agent sessions**.
+Section 2 drives Claude Code and Codex end-to-end because that is the only way
+to prove each harness emits payloads that `prov hook ...` actually consumes.
+Synthetic payload coverage still matters, but it belongs in the automated
+fixture tests listed later in this guide, not in the primary manual path.
 
 The remaining stub (`prov backfill`) is listed at the end so you can
 confirm it still fails loudly rather than silently no-op. (`prov
@@ -39,7 +37,7 @@ SANDBOX="$(mktemp -d /tmp/prov-dogfood-XXXX)"
 cd "$SANDBOX"
 git init -q
 git commit --allow-empty -m "root"
-echo "$SANDBOX"     # remember this path; cleanup at the end
+pwd                 # remember this path; cleanup at the end
 ```
 
 For sync tests you also want a bare "remote" peer:
@@ -58,41 +56,51 @@ git -C "$SANDBOX" remote add origin "$PEER"
 cd "$SANDBOX"
 prov install
 ls .git/hooks/                    # post-commit, pre-push, post-rewrite present
-cat .claude/settings.json         # 4 prov hook entries (SessionStart, UserPromptSubmit, PostToolUse, Stop)
+test ! -e .claude/settings.json   # no Claude adapter config yet
+test ! -e .codex/hooks.json       # no Codex adapter config yet
 git config --get notes.displayRef         # refs/notes/prompts
 git config --get notes.mergeStrategy      # manual
 git config --get notes.rewrite.amend      # false
-test -f .git/prov.db && echo "cache OK"
+test -f .git/prov.db
+
+prov install --agent all
+jq '.hooks | keys' .claude/settings.json
+jq '.hooks | keys' .codex/hooks.json
+grep -n 'hooks = true' .codex/config.toml
 ```
 
 ### Edge cases
 
 ```bash
 # Idempotent re-install: same on-disk state, no duplicate hook blocks.
-prov install
+prov install --agent all
 grep -c '# >>> prov' .git/hooks/post-commit          # exactly 1
 grep -c '"command": "prov hook' .claude/settings.json # exactly 4
+grep -c '"command": "prov hook codex' .codex/hooks.json # exactly 4
 
-# Pre-existing user content in a hook: prov block is added/refreshed in place.
-echo 'echo user-hook' >> .git/hooks/post-commit
-prov install
-grep -A1 '# <<< prov' .git/hooks/post-commit         # user content survives
+# Real-user hook composition: if this repo already has a post-commit hook,
+# verify prov wraps its own block without deleting the existing script body.
+# Do this in a repo that already has a hook; avoid inventing one just for the
+# dogfood pass.
+sed -n '1,120p' .git/hooks/post-commit
+prov install --agent all
+sed -n '1,120p' .git/hooks/post-commit
 
 # Team-mode opt-in (writes a fetch refspec, arms the pre-push gate).
-prov install --enable-push origin
+prov install --agent all --enable-push origin
 git config --get-all remote.origin.fetch             # includes refs/notes/prompts:refs/notes/origin/prompts
 
 # Uninstall removes prov-managed lines but leaves your data.
 prov uninstall
 grep -c '# >>> prov' .git/hooks/post-commit          # 0
-test -f .git/prov.db && echo "cache preserved (expected)"
+test -f .git/prov.db                                 # cache preserved
 git for-each-ref refs/notes/                          # notes ref untouched
 
 # --purge also drops cache and staging.
-prov install
+prov install --agent all
 prov uninstall --purge
-test -f .git/prov.db || echo "cache gone"
-test -d .git/prov-staging || echo "staging gone"
+test ! -f .git/prov.db
+test ! -d .git/prov-staging
 
 # Uninstall is idempotent.
 prov uninstall --purge
@@ -102,7 +110,7 @@ prov uninstall --purge   # no error
 Reinstall before continuing:
 
 ```bash
-prov install --enable-push origin
+prov install --agent all --enable-push origin
 ```
 
 ### Plugin install (alternative path) — U11
@@ -118,8 +126,7 @@ the same four hooks; the plugin path doesn't write `.git/hooks/...` or
 # `prov install --plugin` is informational only — it prints the
 # marketplace install command and exits without touching `.claude/`.
 prov install --plugin
-test -d "$SANDBOX/.claude" && echo "FAIL: --plugin should not create .claude/" \
-  || echo "OK: --plugin did not mutate the project"
+test ! -d "$SANDBOX/.claude"
 
 # Inspect the plugin manifest shipped with prov.
 PLUGIN_DIR="$(dirname "$(command -v prov)")/../../plugin"  # adjust if your binary lives elsewhere
@@ -147,8 +154,7 @@ git commit --allow-empty -m "root"
 # Then run a session with at least one Edit/Write tool use, exit, and:
 git add . 2>/dev/null
 git commit -qm "plugin install smoke" || true
-ls .git/prov-staging/ 2>/dev/null && echo "OK: plugin path captured a session" \
-  || echo "FAIL: no staging dir — hooks didn't fire"
+ls .git/prov-staging/
 cd "$SANDBOX"
 rm -rf "$PLUGIN_SANDBOX"
 ```
@@ -157,70 +163,88 @@ The automated layout lints in `crates/prov-cli/tests/cli_plugin_layout.rs`
 catch frontmatter regressions; the manual run above confirms the
 marketplace install path actually carries a session through capture.
 
-## 2. End-to-end with a real Claude Code session
+## 2. End-to-end with real Claude Code and Codex sessions
 
-This is the integration smoke test. You're verifying that Claude Code
-actually invokes the four registered hooks with the JSON shapes
-`prov hook ...` expects, and that the post-commit flush produces a
-useful note. If anything in this section fails, the simulated tests in
-section 3 will lie to you — the simulator and reality have drifted.
+Run both harness paths when both tools are available. These are the primary
+dogfooding tests because they exercise real harness payloads, real file edits,
+real commits, and the shared read surface. For Codex, the repo-local `.codex/`
+config layer must be trusted and the installed hooks must be reviewed in
+`/hooks` before project hooks run.
 
-> **Restart Claude Code first.** `.claude/settings.json` is read at
-> session start; if the project's settings file was just written by
-> `prov install`, an already-running CLI won't see the new hook entries.
+### 2.1 Claude Code capture, read, search
 
-### 2.1 Capture, read, search (golden path)
-
-In a second terminal, launch Claude Code in the sandbox and ask it to
-do something with at least 2-3 turns and a non-trivial edit:
+Restart Claude Code after `prov install --agent claude`; `.claude/settings.json`
+is read at session start.
 
 ```bash
 cd "$SANDBOX"
 claude       # or however you launch Claude Code
 ```
 
-A representative prompt sequence to type into the session:
+Use a normal multi-turn task that causes real `Edit`, `Write`, or `MultiEdit`
+tool calls:
 
-> Turn 1: Create `src/greet.ts` exporting a `greet(name: string)`
-> function that returns a friendly greeting. Add a brief test in
-> `src/greet.test.ts`.
+> Turn 1: Create `src/greet.ts` exporting a `greet(name: string)` function that
+> returns a friendly greeting. Add a brief test in `src/greet.test.ts`.
 >
-> Turn 2: Tighten the error path so an empty name throws a
-> `TypeError` with a clear message.
+> Turn 2: Tighten the error path so an empty name throws a `TypeError` with a
+> clear message.
 >
-> Turn 3: Extract the greeting template into a `templates.ts`
-> module so it can be reused.
+> Turn 3: Extract the greeting template into a `templates.ts` module so it can
+> be reused.
 
-Exit Claude Code, then back in your dogfooding shell:
+Exit Claude Code, then verify the normal user path:
 
 ```bash
-# Staging shape — every UserPromptSubmit lands a turn-N.json,
-# every Edit/Write/MultiEdit appends to edits.jsonl.
-ls .git/prov-staging/                          # one or more <session-id> dirs
+ls .git/prov-staging/
 ls .git/prov-staging/*/turn-*.json
 ls .git/prov-staging/*/edits.jsonl
 
-# Commit and confirm the post-commit hook flushes a real note onto HEAD.
-git add . && git commit -qm "feat: greet"
-git notes --ref=refs/notes/prompts list | head
-git notes --ref=refs/notes/prompts show HEAD | jq '.edits | length'   # > 0
-git notes --ref=refs/notes/prompts show HEAD | jq '.edits[0].prompt'  # the real prompt text
-
-# Read surface against real captured turns.
+git add . && git commit -qm "feat: greet with claude"
+git notes --ref=refs/notes/prompts show HEAD | jq '.edits | length'
+git notes --ref=refs/notes/prompts show HEAD | jq '.edits[0].tool'
 prov log src/greet.ts
-prov log src/greet.ts:1                        # point lookup against a real edit
-prov log src/greet.ts --history                # earlier turns appear via derived_from
-prov search "greet"                            # FTS hit on the real prompt
+prov log src/greet.ts:1
+prov search "greet"
 ```
 
-If `prov log` returns no provenance for a line you know was just edited,
-inspect `.git/prov-staging/` — the staging files are the source of
-truth for what the hook captured before the post-commit flush.
+Expected: the note contains at least one edit with `"tool": "claude-code"`, and
+the CLI read surfaces return the real prompt text from the Claude Code session.
 
-### 2.2 Private routing (real session)
+### 2.2 Codex capture, read, search
 
-Open a fresh Claude Code session and start the prompt with the opt-out
-marker:
+Reopen Codex in the sandbox after `prov install --agent codex`; Codex must trust
+the repo-local `.codex/` config and you must approve the installed hooks in
+`/hooks` before project hooks run.
+
+Use a normal task that causes Codex to edit files with its file-edit tool:
+
+> Create `src/codex_greet.ts` exporting `codexGreet(name: string)`. Add a small
+> validation branch for empty names and a simple test file. Keep the
+> implementation compact.
+
+After Codex finishes, verify through the same user path:
+
+```bash
+ls .git/prov-staging/
+ls .git/prov-staging/*/turn-*.json
+ls .git/prov-staging/*/edits.jsonl
+
+git add . && git commit -qm "feat: greet with codex"
+git notes --ref=refs/notes/prompts show HEAD | jq '.edits | length'
+git notes --ref=refs/notes/prompts show HEAD | jq '.edits[0].tool'
+prov log src/codex_greet.ts
+prov log src/codex_greet.ts:1
+prov search "codexGreet"
+```
+
+Expected: the note contains at least one edit with `"tool": "codex"`, and no
+Codex-specific read command is needed.
+
+### 2.3 Private routing through a real harness
+
+Run this once through Claude Code and once through Codex if possible. Start the
+agent prompt with the opt-out marker:
 
 > ```
 > # prov:private
@@ -228,63 +252,58 @@ marker:
 > Add a placeholder `loadStagingCredentials()` to `src/secrets.ts`.
 > ```
 
-Make a commit, then verify routing landed it on the private ref only:
+Then verify that the commit writes to the private ref only:
 
 ```bash
 SID=$(ls -t .git/prov-staging | head -1)
-ls .git/prov-staging/$SID/private/             # turn-1.json present here
-ls .git/prov-staging/$SID/turn-*.json 2>/dev/null \
-  || echo "nothing in public dir (expected)"
+ls .git/prov-staging/$SID/private/
+test ! -e .git/prov-staging/$SID/turn-0.json
 
 git add . && git commit -qm "feat: secrets stub"
-git notes --ref=refs/notes/prompts show HEAD 2>/dev/null \
-  || echo "no public note for this commit (expected)"
+test -z "$(git notes --ref=refs/notes/prompts show HEAD 2>/dev/null)"
 git notes --ref=refs/notes/prompts-private show HEAD | jq '.edits | length'
 
-prov log src/secrets.ts                        # local read overlays private on public
+prov log src/secrets.ts
 prov push origin
-git --git-dir="$PEER" for-each-ref refs/notes/prompts-private 2>/dev/null \
-  || echo "private ref absent on remote (expected)"
+test -z "$(git --git-dir="$PEER" for-each-ref refs/notes/prompts-private)"
 ```
 
-### 2.3 Redaction (real session)
+### 2.4 Redaction through a real harness
 
-The redactor runs at write time, before staging hits disk. To exercise
-the typed detectors, paste known-format secrets into the prompt itself:
+Run this through a real agent session, not by piping a synthetic prompt into
+`prov hook`. Paste known-format test credentials into the prompt itself:
 
 > Use the AWS access key `AKIAIOSFODNN7EXAMPLE` and the GitHub token
-> `ghp_1234567890abcdefghijABCDEFGHIJABCD` to wire up a placeholder
-> credential provider in `src/creds.ts`.
+> `ghp_1234567890abcdefghijABCDEFGHIJABCD` to wire up a placeholder credential
+> provider in `src/creds.ts`.
 
-(The values above are well-known test fixtures, not live credentials.)
-Make a commit, then verify nothing leaked:
+The values above are public test fixtures, not live credentials. After the
+agent edits and you commit:
 
 ```bash
 SID=$(ls -t .git/prov-staging | head -1)
 grep REDACTED .git/prov-staging/$SID/turn-*.json
 git add . && git commit -qm "feat: creds stub"
-git notes --ref=refs/notes/prompts show HEAD | grep -c REDACTED   # >= 2
-git notes --ref=refs/notes/prompts show HEAD | grep -E 'AKIA|ghp_' \
-  && echo "FAIL: secret reached the note" \
-  || echo "OK: redactor caught both"
+git notes --ref=refs/notes/prompts show HEAD | grep -c REDACTED
+test -z "$(git notes --ref=refs/notes/prompts show HEAD | grep -E 'AKIA|ghp_')"
 ```
 
-### 2.4 Rewrite migration (real session + amend)
+### 2.5 Rewrite migration (real session + amend)
 
 After capturing real turns above, exercise the post-rewrite hook with
 an amend:
 
 ```bash
 HEAD_BEFORE=$(git rev-parse HEAD)
-echo "// tweak" >> src/greet.ts
+# Make a small real edit to a captured file with your editor, then amend.
+$EDITOR src/greet.ts
 git commit -qa --amend --no-edit
 HEAD_AFTER=$(git rev-parse HEAD)
-git notes --ref=refs/notes/prompts list | grep "$HEAD_AFTER" && echo "migrated"
-git notes --ref=refs/notes/prompts list | grep "$HEAD_BEFORE" \
-  || echo "old SHA cleaned up"
+git notes --ref=refs/notes/prompts list | grep "$HEAD_AFTER"
+test -z "$(git notes --ref=refs/notes/prompts list | grep "$HEAD_BEFORE")"
 ```
 
-### 2.5 Skill — agent-side trigger fidelity (U12)
+### 2.6 Skill — agent-side trigger fidelity (U12)
 
 The Skill at `plugin/skills/prov/SKILL.md` teaches Claude Code to query
 its own provenance before substantive edits. Trigger fidelity (does the
@@ -366,11 +385,12 @@ present, body ≤500 lines, references linked) catch regressions in the
 SKILL artifact itself; what they cannot catch is whether the agent
 actually fires correctly. That's why this section is manual.
 
-### 2.6 What "working end-to-end" means here
+### 2.7 What "working end-to-end" means here
 
 By the end of section 2 you should have observed all of:
 
 - Real Claude Code prompts staged into `.git/prov-staging/<session-id>/`
+- Real Codex prompts and `apply_patch` edits staged into the same tree
 - A `post-commit` hook flushed those into a note attached to HEAD
 - `prov log` and `prov search` returned the real prompt text on demand
 - `# prov:private` routed an entire session away from the public ref,
@@ -383,72 +403,31 @@ If any one of those failed, capture the staging dir + notes ref
 contents before debugging — they're the most useful artifacts for
 diagnosing hook-pipeline regressions.
 
-## 3. Capture: simulated hook events (reproducible)
+## 3. Fixture-backed hook coverage
 
-The `post-commit` hook flushes whatever is staged in `.git/prov-staging/`
-into a note attached to HEAD. Section 2 confirmed Claude Code drives
-this end-to-end; this section drives the same handlers with synthetic
-JSON so you can hit edge cases on demand:
-
-```bash
-SID="dogfood-$(date +%s)"
-
-# Simulate a SessionStart.
-echo "{\"session_id\":\"$SID\",\"model\":\"claude-sonnet-4-5\"}" \
-  | prov hook session-start
-
-# Simulate a UserPromptSubmit (public).
-echo "{\"session_id\":\"$SID\",\"prompt\":\"add a hello function\",\"cwd\":\"$SANDBOX\",\"transcript_path\":\"\"}" \
-  | prov hook user-prompt-submit
-
-# Simulate the agent's edit landing on disk.
-mkdir -p src && cat > src/hello.ts <<'EOF'
-export function hello(name: string) {
-  return `hello, ${name}`;
-}
-EOF
-
-# Simulate the PostToolUse for that edit (ranges are 1-indexed inclusive).
-echo "{\"session_id\":\"$SID\",\"tool_input\":{\"file_path\":\"src/hello.ts\",\"writes\":[{\"line_start\":1,\"line_end\":3}]}}" \
-  | prov hook post-tool-use
-
-# Simulate the turn ending.
-echo "{\"session_id\":\"$SID\"}" | prov hook stop
-
-# Commit — post-commit will fire and write a note on HEAD.
-git add src/hello.ts
-git commit -q -m "feat: hello"
-git notes --ref=refs/notes/prompts list | head    # should list HEAD's note
-```
-
-### Edge cases
+Do not use synthetic `echo ... | prov hook ...` recipes as the primary
+dogfooding path. They prove the parser accepts one invented shape; they do not
+prove Claude Code or Codex still emits that shape. Use the real harness flows in
+section 2 first, then run the automated fixture coverage when you need
+reproducible edge-case confidence:
 
 ```bash
-# Private routing — # prov:private on the first line lands the prompt and
-# its edits in .git/prov-staging/<sid>/private/, not the public dir.
-SID="priv-$(date +%s)"
-echo "{\"session_id\":\"$SID\",\"model\":\"claude-sonnet-4-5\"}" | prov hook session-start
-echo "{\"session_id\":\"$SID\",\"prompt\":\"# prov:private\nrotate the staging credentials\",\"cwd\":\"$SANDBOX\",\"transcript_path\":\"\"}" \
-  | prov hook user-prompt-submit
-ls .git/prov-staging/$SID/private/    # turn-1.json present here, NOT in the public dir
-ls .git/prov-staging/$SID/ | grep -v private || true
-
-# Redaction — secrets in the prompt become [REDACTED:...] markers before staging.
-SID="redact-$(date +%s)"
-echo "{\"session_id\":\"$SID\",\"model\":\"x\"}" | prov hook session-start
-echo "{\"session_id\":\"$SID\",\"prompt\":\"key=AKIAIOSFODNN7EXAMPLE and pat=ghp_1234567890abcdefghijABCDEFGHIJABCD\",\"cwd\":\"$SANDBOX\",\"transcript_path\":\"\"}" \
-  | prov hook user-prompt-submit
-grep REDACTED .git/prov-staging/$SID/turn-*.json     # AWS key and GitHub PAT both replaced
-
-# .provignore — repo-local regex rules add custom redactors.
-echo 'AcmeCorp-[A-Z0-9]{8}' > .provignore
-SID="provign-$(date +%s)"
-echo "{\"session_id\":\"$SID\",\"model\":\"x\"}" | prov hook session-start
-echo "{\"session_id\":\"$SID\",\"prompt\":\"customer=AcmeCorp-AB12CD34\",\"cwd\":\"$SANDBOX\",\"transcript_path\":\"\"}" \
-  | prov hook user-prompt-submit
-grep 'REDACTED:provignore-rule' .git/prov-staging/$SID/turn-*.json
-rm .provignore
+cargo test -p prov --test hook_capture
+cargo test -p prov --test cli_codex_layout
+cargo test -p prov-core schema::tests::non_claude_tool_value_roundtrips
 ```
+
+Those tests cover:
+
+- Legacy Claude hook commands and adapter-qualified Claude commands.
+- Codex `SessionStart`, `UserPromptSubmit`, `PostToolUse` with `apply_patch`,
+  and `Stop` fixtures.
+- Private routing, redaction, malformed JSON, missing transcript fallback, and
+  end-to-end post-commit flushing into normal notes.
+
+When a real dogfood session fails but these tests pass, trust the real session:
+the harness payload contract probably changed, or the repo-local harness config
+did not load.
 
 ## 4. Read surface
 
@@ -509,8 +488,8 @@ prov log src/hello.ts                                # forces freshness check; r
 ```bash
 SHA=$(git rev-parse HEAD)
 prov mark-private "$SHA"
-git notes --ref=refs/notes/prompts list | grep "$SHA" || echo "removed from public"
-git notes --ref=refs/notes/prompts-private list | grep "$SHA" && echo "now private"
+test -z "$(git notes --ref=refs/notes/prompts list | grep "$SHA")"
+git notes --ref=refs/notes/prompts-private list | grep "$SHA"
 
 # Idempotent on already-private (no-op message, exit 0).
 prov mark-private "$SHA"
@@ -520,24 +499,20 @@ ROOT=$(git rev-list --max-parents=0 HEAD)
 prov mark-private "$ROOT"
 
 # Bad ref — git's error surfaces.
-prov mark-private deadbeef || echo "expected failure"
+! prov mark-private deadbeef
 ```
 
 ### `prov redact-history`
 
 ```bash
-# Set up a note containing a secret-looking string, then scrub it.
-SID="leak-$(date +%s)"
-echo "{\"session_id\":\"$SID\",\"model\":\"x\"}" | prov hook session-start
-echo "{\"session_id\":\"$SID\",\"prompt\":\"the token is sk_live_supersecret\",\"cwd\":\"$SANDBOX\",\"transcript_path\":\"\"}" \
-  | prov hook user-prompt-submit
-echo "{\"session_id\":\"$SID\"}" | prov hook stop
-echo leak >> src/hello.ts && git add . && git commit -qm "leak"
-prov redact-history 'sk_live_[A-Za-z0-9]+'
-git notes --ref=refs/notes/prompts show HEAD | grep -c REDACTED   # >=1
+# The real-session redaction check in section 2.4 proves write-time redaction.
+# For retroactive history scrubbing, use a branch/repo where you already have a
+# known bad note from older capture, then scrub it:
+prov redact-history '<known leaked pattern>'
+git notes --ref=refs/notes/prompts show HEAD | grep -c REDACTED
 
 # Invalid regex must error before any rewrite.
-prov redact-history 'invalid[regex' || echo "expected fail"
+! prov redact-history 'invalid[regex'
 
 # Pattern that matches nothing — reports 0, exits 0.
 prov redact-history 'will-not-appear-anywhere'
@@ -554,19 +529,16 @@ prov push origin
 git --git-dir="$PEER" for-each-ref refs/notes/
 
 # Pre-push gate: a secret hidden in a note should block the push.
-SID="badpush-$(date +%s)"
-echo "{\"session_id\":\"$SID\",\"model\":\"x\"}" | prov hook session-start
-# Bypass the write-time redactor by editing the note in place after capture.
-echo "{\"session_id\":\"$SID\",\"prompt\":\"safe\",\"cwd\":\"$SANDBOX\",\"transcript_path\":\"\"}" \
-  | prov hook user-prompt-submit
-echo "{\"session_id\":\"$SID\"}" | prov hook stop
-echo gate >> src/hello.ts && git add . && git commit -qm "gate"
+# Start from a real captured note, then deliberately seed the note with a
+# known-format test secret to verify the push gate catches old/bad data.
+$EDITOR src/greet.ts
+git add . && git commit -qm "gate"
 git notes --ref=refs/notes/prompts append -m 'leaked: AKIAIOSFODNN7EXAMPLE' HEAD
-prov push origin || echo "expected: gate blocked the push"
+! prov push origin
 
 # Documented escape hatch — bypass + audit trail in staging.
 prov push origin --no-verify
-ls .git/prov-staging/log 2>/dev/null && echo "override logged"
+grep no-verify .git/prov-staging/log
 
 # Clean up the seeded leak.
 prov redact-history 'AKIA[A-Z0-9]+'
@@ -597,7 +569,7 @@ HEAD_SHA=$(git rev-parse HEAD)
 git notes --ref=refs/notes/prompts add -f \
   -m '{"schema_version":1,"edits":[{"file":"src/hello.ts","line_range":[1,3],"prompt":"sandbox side"}]}' \
   "$HEAD_SHA"
-prov fetch origin || echo "merge in progress (expected)"
+! prov fetch origin
 ls .git/NOTES_MERGE_WORKTREE/                   # one file per conflicted commit
 prov notes-resolve
 git notes --ref=refs/notes/prompts show "$HEAD_SHA" | jq '.edits | length'   # union >= 2
@@ -619,7 +591,7 @@ they're green before relying on the binary):
 
 ## 8. Rewrite preservation (rebase / squash / repair)
 
-Section 2.4 already covered the amend path with a real session. The
+Section 2.5 already covered the amend path with a real session. The
 recipes below stress the rebase, squash, and repair codepaths the
 real-session walkthrough doesn't.
 
@@ -627,7 +599,10 @@ real-session walkthrough doesn't.
 
 ```bash
 git checkout -q -b r1
-for i in 1 2 3; do echo "line $i" >> src/big.ts; git commit -qam "step $i"; done
+# Make three small real edits to a captured file, committing after each edit.
+$EDITOR src/big.ts && git commit -am "step 1"
+$EDITOR src/big.ts && git commit -am "step 2"
+$EDITOR src/big.ts && git commit -am "step 3"
 GIT_SEQUENCE_EDITOR='sed -i.bak -e "2,\$ s/^pick/squash/"' git rebase -i HEAD~3
 NEW=$(git rev-parse HEAD)
 git notes --ref=refs/notes/prompts show "$NEW" | jq '.edits | length'   # >= sum of pre-squash edits
@@ -640,15 +615,15 @@ git branch -D r1
 ```bash
 # Force orphaning by rewriting via a path that bypasses prov: capture, then
 # blow away the note before the post-rewrite hook fires.
-echo orphan >> src/hello.ts && git commit -qam "orphan"
+$EDITOR src/hello.ts && git commit -am "orphan"
 ORPHAN_OLD=$(git rev-parse HEAD)
 git -c core.hooksPath=/dev/null commit -q --amend --no-edit   # post-rewrite skipped
 ORPHAN_NEW=$(git rev-parse HEAD)
-git notes --ref=refs/notes/prompts list | grep "$ORPHAN_NEW" || echo "orphaned (expected)"
+test -z "$(git notes --ref=refs/notes/prompts list | grep "$ORPHAN_NEW")"
 
 prov repair --dry-run
 prov repair
-git notes --ref=refs/notes/prompts list | grep "$ORPHAN_NEW" && echo "repaired"
+git notes --ref=refs/notes/prompts list | grep "$ORPHAN_NEW"
 
 # Re-running is idempotent (new SHA already has a note → skipped).
 prov repair --json | jq '.results[] | select(.status == "skipped-existing")' | head -1
@@ -666,25 +641,23 @@ prov gc --dry-run --json | jq .
 
 # Force an unreachable commit and confirm gc culls its note.
 git checkout -q --detach
-echo dead > src/dead.ts && git add . && git commit -qm "dead"
+$EDITOR src/dead.ts
+git add . && git commit -qm "dead"
 DEAD=$(git rev-parse HEAD)
-SID="dead-$(date +%s)"
-echo "{\"session_id\":\"$SID\",\"model\":\"x\"}" | prov hook session-start
-echo "{\"session_id\":\"$SID\",\"prompt\":\"dead\",\"cwd\":\"$SANDBOX\",\"transcript_path\":\"\"}" | prov hook user-prompt-submit
-echo "{\"session_id\":\"$SID\"}" | prov hook stop
 git notes --ref=refs/notes/prompts add -f -m '{"schema_version":1,"edits":[]}' "$DEAD"
 git checkout -q main                              # $DEAD now unreachable
 prov gc
-git notes --ref=refs/notes/prompts list | grep "$DEAD" || echo "culled"
+test -z "$(git notes --ref=refs/notes/prompts list | grep "$DEAD")"
 
 # But: detached-HEAD WIP must NOT be culled. Regression test:
 # gc_preserves_notes_for_detached_head_commits.
 git checkout -q --detach
-echo wip > src/wip.ts && git add . && git commit -qm "wip"
+$EDITOR src/wip.ts
+git add . && git commit -qm "wip"
 WIP=$(git rev-parse HEAD)
 git notes --ref=refs/notes/prompts add -f -m '{"schema_version":1,"edits":[]}' "$WIP"
 prov gc
-git notes --ref=refs/notes/prompts list | grep "$WIP" && echo "wip preserved"
+git notes --ref=refs/notes/prompts list | grep "$WIP"
 git checkout -q main
 
 # Staging TTL: stale dirs prune; unreadable mtime should still prune (defensive
@@ -692,7 +665,7 @@ git checkout -q main
 mkdir -p .git/prov-staging/old-session
 touch -t 200001010000 .git/prov-staging/old-session
 prov gc --staging-ttl-days 1
-ls .git/prov-staging/old-session 2>/dev/null || echo "pruned"
+test ! -e .git/prov-staging/old-session
 
 # --compact drops preceding_turns_summary on notes >90 days old (need real-aged
 # notes to verify; on a fresh sandbox this is a no-op).
@@ -702,12 +675,11 @@ prov gc --compact --dry-run
 ## 10. Stubs (should fail loudly, not no-op)
 
 ```bash
-prov backfill --yes              || echo "stub fail (expected)"
+! prov backfill --yes
 
 # `prov regenerate` was dropped from v1 — it should be unknown, not stubbed.
-prov regenerate src/hello.ts:2 2>&1 | grep -q "unrecognized subcommand" \
-  && echo "OK: regenerate is gone, not stubbed" \
-  || echo "FAIL: regenerate either silently succeeded or is still wired as a stub"
+! prov regenerate src/hello.ts:2
+prov regenerate src/hello.ts:2 2>&1 | grep -q "unrecognized subcommand"
 ```
 
 If `prov backfill` silently succeeds, that's a regression — it's
@@ -752,8 +724,10 @@ unset SANDBOX PEER CLONE SID SHA HEAD_BEFORE HEAD_AFTER ORPHAN_OLD ORPHAN_NEW DE
 
 ## Appendix: troubleshooting
 
-- **Hook didn't fire after `prov install`.** Restart Claude Code —
-  `.claude/settings.json` is read at session start. For git hooks,
+- **Hook didn't fire after `prov install`.** Restart the agent harness.
+  Claude Code reads `.claude/settings.json` at session start; Codex must trust
+  the repo-local `.codex/` layer and review hooks in `/hooks` before project
+  hooks run. For git hooks,
   confirm `core.hooksPath` is unset (or includes `.git/hooks`) and
   inspect `.git/hooks/post-commit` for the `# >>> prov` block.
 - **Note not visible after commit.** Run `prov reindex`. The post-commit

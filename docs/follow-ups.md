@@ -11,6 +11,21 @@ with a commit/PR link).
 
 ---
 
+## Agent harness adapters
+
+- [ ] **Evaluate Cursor against the adapter readiness bar.** Cursor is a
+  future adapter candidate, not a shipped harness. Before planning support,
+  verify prompt/session/edit lifecycle hooks, whether hooks run locally and in
+  cloud/remote contexts, payload stability, non-blocking behavior, privacy
+  routing compatibility, and whether repo-local install/uninstall can preserve
+  user config.
+
+- [ ] **Evaluate Pi against the adapter readiness bar.** Pi appears more likely
+  to require an extension-style integration than a declarative hook template.
+  Validate extension packaging, lifecycle fidelity, file-edit payload shape,
+  repo trust/config behavior, and whether Prov can capture without transcript
+  scraping or blocking the agent loop.
+
 ## U3 — Capture pipeline (PR #3)
 
 - [ ] **Surface "captured but not yet flushed" state to the user.** Capture
