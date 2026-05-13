@@ -22,3 +22,6 @@ action/.npm/
 # Local secrets
 .env
 .env.local
+
+# Local-only docs (not tracked)
+docs/
