@@ -24,6 +24,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Homebrew's preinstalled cargo stub on macos-15 dispatches to
+      # rustup-init; put rustup-managed proxies ahead of it on PATH.
+      - name: prefer rustup proxies over Homebrew cargo stub
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@v2
       - name: cargo build
         run: cargo build --workspace --all-targets --locked
