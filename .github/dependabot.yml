@@ -1,0 +1,13 @@
+# Dependabot keeps third-party GitHub Actions up to date by opening PRs that
+# bump SHA-pinned references. The `cooldown` window enforces that a new
+# version must have existed for `default-days` before Dependabot proposes
+# an upgrade — gives the community time to detect and yank a compromised
+# release before we pick it up.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
