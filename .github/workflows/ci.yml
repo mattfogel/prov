@@ -24,22 +24,16 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-13
-      - name: debug toolchain state (post-dtolnay, pre-cache)
-        run: |
-          echo "=== which cargo ==="; which cargo || true
-          echo "=== PATH ==="; echo "$PATH"
-          echo "=== ls ~/.cargo/bin ==="; ls -la "$HOME/.cargo/bin/" 2>&1 || true
-          echo "=== file ~/.cargo/bin/cargo ==="; file "$HOME/.cargo/bin/cargo" 2>&1 || true
-          echo "=== ~/.cargo/bin/cargo --version ==="; "$HOME/.cargo/bin/cargo" --version 2>&1 || true
-          echo "=== ls ~/.rustup ==="; ls -la "$HOME/.rustup/" 2>&1 || true
-          echo "=== ls ~/.rustup/toolchains ==="; ls -la "$HOME/.rustup/toolchains/" 2>&1 || true
-          echo "=== rustup show ==="; rustup show 2>&1 || true
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: debug toolchain state (post-cache)
-        run: |
-          echo "=== ls ~/.cargo/bin ==="; ls -la "$HOME/.cargo/bin/" 2>&1 || true
-          echo "=== file ~/.cargo/bin/cargo ==="; file "$HOME/.cargo/bin/cargo" 2>&1 || true
-          echo "=== ~/.cargo/bin/cargo --version ==="; "$HOME/.cargo/bin/cargo" --version 2>&1 || true
+        with:
+          # Do NOT cache ~/.cargo/bin. A prior macOS run captured a poisoned
+          # ~/.cargo/bin/rustup symlink pointing at /opt/homebrew/bin/rustup-init
+          # (Homebrew's broken wrapper). Every restore overwrote the working
+          # rustup that dtolnay installs, breaking `cargo build` with
+          # "unexpected argument 'build'". prefix-key is bumped to evict the
+          # existing poisoned cache entries.
+          cache-bin: "false"
+          prefix-key: "v1-rust"
       - name: cargo build
         run: cargo build --workspace --all-targets --locked
       - name: cargo test
@@ -54,6 +48,9 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-bin: "false"
+          prefix-key: "v1-rust"
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo clippy
