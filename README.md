@@ -37,17 +37,6 @@ Until the first tagged release ships, install from source:
 cargo install --git https://github.com/mattfogel/prov prov
 ```
 
-Tagged release channels are on the way:
-
-```bash
-# Coming with the first tagged release
-cargo install prov                                                                  # crates.io
-brew install mattfogel/tap/prov                                                     # Homebrew tap
-curl -fsSL https://raw.githubusercontent.com/mattfogel/prov/main/install.sh | sh    # cosign-verified
-```
-
-Each tagged release will be signed with [Sigstore cosign](https://www.sigstore.dev/) keyless. The install script will verify the signature before exec — SHA256 alone is not enough against a release-asset compromise.
-
 ## Quick start
 
 ```bash
@@ -92,10 +81,6 @@ Run `./scripts/check.sh` before opening a PR — it mirrors CI (build, test, `ca
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) **OR** [Apache-2.0](LICENSE-APACHE) at your option, matching Rust ecosystem convention.
-
-## Funding
-
-If a team finds Prov useful and wants to fund maintenance, [GitHub Sponsors](https://github.com/sponsors/mattfogel) is the answer.
 
 ## Posture
 
