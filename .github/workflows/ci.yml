@@ -24,10 +24,17 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-13
-      # Homebrew's preinstalled cargo stub on macos-15 dispatches to
-      # rustup-init; put rustup-managed proxies ahead of it on PATH.
-      - name: prefer rustup proxies over Homebrew cargo stub
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # Homebrew's preinstalled `cargo`/`rustc` wrappers on macos-15
+      # dispatch to rustup-init and fail with "unexpected argument 'build'"
+      # under unpredictable runner/PATH conditions. Remove them so the
+      # rustup-managed proxies under ~/.cargo/bin (installed by dtolnay
+      # above) are the only ones available — eliminates the race.
+      - name: remove Homebrew rust stubs on macOS
+        if: runner.os == 'macOS'
+        run: |
+          for tool in cargo rustc rustup rustdoc rust-gdb rust-lldb rust-analyzer; do
+            rm -f "/opt/homebrew/bin/$tool" "/usr/local/bin/$tool"
+          done
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: cargo build
         run: cargo build --workspace --all-targets --locked
