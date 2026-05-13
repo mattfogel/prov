@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "prov"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "prov-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "libc",

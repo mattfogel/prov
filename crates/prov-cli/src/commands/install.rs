@@ -146,6 +146,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     if adapters.contains(&AgentAdapter::Codex) {
         println!("  codex:    {}", codex_hooks_path(&git).display());
         println!("  codex:    project hooks require Codex to trust this repo's `.codex/` config");
+        println!("  codex:    open `/hooks` in Codex to review newly installed hooks");
     }
     if let Some(remote) = args.enable_push {
         println!(
@@ -444,13 +445,30 @@ fn merge_codex_feature_flag(path: &Path) -> anyhow::Result<String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    if existing
-        .lines()
-        .any(|line| line.trim() == "codex_hooks = true")
-    {
-        return Ok(ensure_trailing_newline(existing));
-    }
     let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
+    let mut saw_hooks_flag = false;
+    let mut in_features = false;
+    lines.retain_mut(|line| {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_features = trimmed == "[features]";
+        }
+        if in_features && trimmed == "codex_hooks = true" {
+            return false;
+        }
+        if in_features
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "hooks")
+        {
+            *line = "hooks = true".to_string();
+            saw_hooks_flag = true;
+        }
+        true
+    });
+    if saw_hooks_flag {
+        return Ok(ensure_trailing_newline(lines.join("\n")));
+    }
     if let Some(features_idx) = lines.iter().position(|line| line.trim() == "[features]") {
         let insert_at = lines[features_idx + 1..]
             .iter()
@@ -459,14 +477,14 @@ fn merge_codex_feature_flag(path: &Path) -> anyhow::Result<String> {
                 trimmed.starts_with('[') && trimmed.ends_with(']')
             })
             .map_or(lines.len(), |relative| features_idx + 1 + relative);
-        lines.insert(insert_at, "codex_hooks = true".to_string());
+        lines.insert(insert_at, "hooks = true".to_string());
         return Ok(ensure_trailing_newline(lines.join("\n")));
     }
     if !lines.is_empty() && !lines.last().is_some_and(|line| line.trim().is_empty()) {
         lines.push(String::new());
     }
     lines.push("[features]".to_string());
-    lines.push("codex_hooks = true".to_string());
+    lines.push("hooks = true".to_string());
     Ok(ensure_trailing_newline(lines.join("\n")))
 }
 

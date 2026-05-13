@@ -189,7 +189,8 @@ fn install_agent_codex_writes_codex_config_only() {
 
     let config = std::fs::read_to_string(tmp.path().join(".codex/config.toml")).unwrap();
     assert!(config.contains("[features]"));
-    assert!(config.contains("codex_hooks = true"));
+    assert!(config.contains("hooks = true"));
+    assert!(!config.contains("codex_hooks = true"));
 }
 
 #[test]
@@ -231,7 +232,8 @@ fn install_preserves_user_codex_config_keys_and_hooks() {
     let config = std::fs::read_to_string(codex_dir.join("config.toml")).unwrap();
     assert!(config.contains("model = \"gpt-5.4-codex\""));
     assert!(config.contains("other = true"));
-    assert!(config.contains("codex_hooks = true"));
+    assert!(config.contains("hooks = true"));
+    assert!(!config.contains("codex_hooks = true"));
 
     let raw = std::fs::read_to_string(codex_dir.join("hooks.json")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -250,6 +252,28 @@ fn install_preserves_user_codex_config_keys_and_hooks() {
     assert!(stop_arr
         .iter()
         .any(|e| commands(e).iter().any(|c| c == "prov hook codex stop")));
+}
+
+#[test]
+fn install_agent_codex_migrates_deprecated_feature_flag() {
+    let tmp = init_repo();
+    let codex_dir = tmp.path().join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(
+        codex_dir.join("config.toml"),
+        "model = \"gpt-5.4-codex\"\n\n[features]\ncodex_hooks = true\n",
+    )
+    .unwrap();
+
+    prov_in(tmp.path())
+        .args(["install", "--agent", "codex"])
+        .assert()
+        .success();
+
+    let config = std::fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+    assert!(config.contains("model = \"gpt-5.4-codex\""));
+    assert!(config.contains("hooks = true"));
+    assert!(!config.contains("codex_hooks = true"));
 }
 
 #[test]
@@ -479,6 +503,7 @@ fn uninstall_removes_codex_config_but_preserves_user_content() {
     assert!(config.contains("model = \"gpt-5.4-codex\""));
     assert!(config.contains("other = true"));
     assert!(!config.contains("codex_hooks = true"));
+    assert!(!config.contains("hooks = true"));
 
     let raw = std::fs::read_to_string(codex_dir.join("hooks.json")).unwrap();
     assert!(raw.contains("echo user"));

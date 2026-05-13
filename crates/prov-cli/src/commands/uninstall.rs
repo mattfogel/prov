@@ -113,9 +113,20 @@ fn uninstall_codex_config(git: &Git) -> anyhow::Result<()> {
 }
 
 fn remove_codex_feature_flag(src: &str) -> String {
+    let mut in_features = false;
     let lines = src
         .lines()
-        .filter(|line| line.trim() != "codex_hooks = true")
+        .filter(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                in_features = trimmed == "[features]";
+            }
+            !in_features
+                || (trimmed != "codex_hooks = true"
+                    && !trimmed.split_once('=').is_some_and(|(key, value)| {
+                        key.trim() == "hooks" && value.trim() == "true"
+                    }))
+        })
         .map(str::to_string)
         .collect::<Vec<_>>();
     if lines.iter().all(|line| {

@@ -49,7 +49,7 @@ prov log src/auth.ts:42              # see the originating prompt for one line
 prov search "rate limiting"          # find prompts that mention rate limiting
 ```
 
-Codex project-local hooks require Codex to trust the repo's `.codex/` config layer before they run.
+Codex project-local hooks require Codex to trust the repo's `.codex/` config layer and review the installed hooks in `/hooks` before they run.
 
 By default, notes stay on your machine. To share with your team:
 
