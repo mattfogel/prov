@@ -7,9 +7,13 @@ any meaningful edit to `SKILL.md`'s `description:` or body.
 
 ## Setup
 
-1. Install the `prov` binary so it's on `PATH`.
-2. Install this plugin (`/plugin install --plugin-dir <repo>/plugin` or
-   marketplace).
+1. Install the `prov` binary so it's on `PATH` and run
+   `prov install --agent claude` in the fixture repo (gets the capture
+   hooks in place so the fixture has notes to query).
+2. Install this skill into the fixture repo:
+   `npx skills add github.com/mattfogel/prov` (or
+   `npx skills add <local path to this checkout>` when testing local
+   edits).
 3. Restart Claude Code so the skill registry reloads.
 4. Use a fixture repo seeded with provenance notes — either a real repo
    where Claude Code has been used for a few sessions, or the fixture under

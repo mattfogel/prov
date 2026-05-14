@@ -1,6 +1,6 @@
-//! U12 SKILL content lints.
+//! SKILL content lints.
 //!
-//! Validates the on-disk shape of `plugin/skills/prov/`: frontmatter has the
+//! Validates the on-disk shape of `skills/prov/`: frontmatter has the
 //! required keys, the body fits under the 500-line cap, the two reference
 //! docs exist and are linked from `SKILL.md`, and the manual smoke-test plan
 //! is committed alongside.
@@ -16,7 +16,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn skill_dir() -> PathBuf {
-    workspace_root().join("plugin").join("skills").join("prov")
+    workspace_root().join("skills").join("prov")
 }
 
 /// Splits a SKILL.md-style file into (frontmatter, body). Frontmatter is the

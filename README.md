@@ -55,6 +55,14 @@ prov log src/auth.ts:42              # the originating prompt for one line
 prov search "rate limiting"          # find prompts that mention rate limiting
 ```
 
+Optional: install the agent skill so Claude Code (or any harness that supports Anthropic-style Skills) can answer provenance questions directly in the session — "why does this line do X", "what's the history of this file", "is this drifted":
+
+```bash
+npx skills add mattfogel/prov
+```
+
+The skill is independent of the capture hooks above — install it per-repo or globally as you prefer; see [Vercel's `skills` CLI](https://github.com/vercel-labs/skills) for flags.
+
 Codex project-local hooks require Codex to trust the repo's `.codex/` config layer; review the installed hooks via `/hooks` before they run.
 
 By default, notes stay on your machine. Opt in to team sharing per-remote:
@@ -71,7 +79,8 @@ Pre-1.0. The on-disk note format is stable; the CLI surface and config keys may 
 
 - [`crates/prov-core`](crates/prov-core) — library: git wrapping, notes I/O, SQLite cache, redactor, transcript parsers.
 - [`crates/prov-cli`](crates/prov-cli) — the `prov` binary and subcommands.
-- [`plugin/`](plugin) — Claude Code plugin (skill + hooks manifest).
+- [`agent-hooks/`](agent-hooks) — Claude Code capture-hook bundle, embedded into the `prov` binary at build time.
+- [`skills/`](skills) — the optional Anthropic-style agent skill (install via `npx skills add mattfogel/prov`).
 - [`codex/`](codex) — Codex hooks adapter.
 
 ## Contributing

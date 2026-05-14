@@ -1,8 +1,10 @@
-//! U11 plugin-layout tests.
+//! Agent-hooks bundle layout tests.
 //!
-//! Validates the on-disk shape of `plugin/` against the documented Claude
-//! Code plugin schema, plus the behavioral guarantee that
-//! `prov install --plugin` exits without mutating the project's `.claude/`.
+//! Validates the on-disk shape of `agent-hooks/` — the directory whose
+//! `hooks.json` is embedded by `prov install --agent claude` into a repo's
+//! `.claude/settings.json`. The previous shape lived under `plugin/` and
+//! carried a Claude Code plugin manifest; the manifest is gone, but the
+//! hooks bundle itself is still load-bearing and worth lint-testing.
 
 use std::path::{Path, PathBuf};
 
@@ -17,8 +19,8 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn plugin_dir() -> PathBuf {
-    workspace_root().join("plugin")
+fn agent_hooks_dir() -> PathBuf {
+    workspace_root().join("agent-hooks")
 }
 
 fn read_json(path: &Path) -> Value {
@@ -31,37 +33,8 @@ fn read_json(path: &Path) -> Value {
 }
 
 #[test]
-fn plugin_manifest_has_required_fields() {
-    let manifest = plugin_dir().join(".claude-plugin").join("plugin.json");
-    let value = read_json(&manifest);
-    let obj = value
-        .as_object()
-        .expect("plugin.json must be a JSON object");
-
-    // The Claude Code plugin schema requires `name` at minimum; we additionally
-    // require `description` and `version` so the marketplace listing has
-    // enough metadata to render usefully.
-    for required in ["name", "description", "version"] {
-        assert!(
-            obj.contains_key(required),
-            "plugin.json is missing required field `{required}`"
-        );
-        assert!(
-            obj[required].is_string() && !obj[required].as_str().unwrap().is_empty(),
-            "plugin.json field `{required}` must be a non-empty string"
-        );
-    }
-
-    assert_eq!(
-        obj["name"].as_str().unwrap(),
-        "prov",
-        "plugin name must be `prov` (matches binary name and marketplace install command)"
-    );
-}
-
-#[test]
-fn plugin_hooks_register_all_four_events() {
-    let hooks_path = plugin_dir().join("hooks").join("hooks.json");
+fn agent_hooks_register_all_four_events() {
+    let hooks_path = agent_hooks_dir().join("hooks.json");
     let value = read_json(&hooks_path);
     let hooks = value
         .get("hooks")
@@ -119,7 +92,7 @@ fn plugin_hooks_register_all_four_events() {
             Some(*command),
             "event `{event}` command mismatch"
         );
-        // Plan specifies a 5-second timeout for every capture hook.
+        // 5-second timeout for every capture hook.
         assert_eq!(
             nested_hook.get("timeout").and_then(Value::as_i64),
             Some(5),
@@ -129,14 +102,10 @@ fn plugin_hooks_register_all_four_events() {
 }
 
 #[test]
-fn plugin_readme_exists() {
-    let readme = plugin_dir().join("README.md");
+fn agent_hooks_readme_exists() {
+    let readme = agent_hooks_dir().join("README.md");
     assert!(
         readme.exists(),
-        "plugin/README.md must exist so marketplace listings have install instructions"
+        "agent-hooks/README.md must exist so the directory is self-explanatory"
     );
 }
-
-// Behavioral coverage for `prov install --plugin` not mutating `.claude/`
-// lives in `cli_read.rs::install_plugin_flag_does_not_touch_repo` — the U5
-// install tests own that fixture setup and we don't duplicate it here.

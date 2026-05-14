@@ -9,9 +9,6 @@
 //! - Optionally adds prov's agent-harness hook entries to repo-local adapter config.
 //! - Initializes `<git-dir>/prov.db` and runs an initial reindex.
 //!
-//! `--plugin` prints the Claude Code marketplace install command
-//! (`/plugin install prov`) and exits without modifying the project's
-//! `.claude/`. The plugin assumes the `prov` binary is on `PATH`.
 //! `--enable-push <REMOTE>` opts into team mode by adding the notes-tracking
 //! fetch refspec for the named remote. The pre-push gate that R6 promises
 //! ships in U8; until then `--enable-push` documents itself as "fetch only".
@@ -47,9 +44,9 @@ const PRE_PUSH_TEMPLATE: &str = include_str!("../../../../githooks/pre-push");
 /// pre-rewrite commit would orphan when git replaced the SHA.
 const POST_REWRITE_TEMPLATE: &str = include_str!("../../../../githooks/post-rewrite");
 
-/// Embedded plugin/hooks/hooks.json so `--plugin`-less installs can mirror the
-/// plugin's hook entries into project-scope `.claude/settings.json`.
-const PLUGIN_HOOKS_JSON: &str = include_str!("../../../../plugin/hooks/hooks.json");
+/// Embedded `agent-hooks/hooks.json` — the Claude Code capture-hook entries
+/// merged into project-scope `.claude/settings.json` by `--agent claude`.
+const CLAUDE_HOOKS_JSON: &str = include_str!("../../../../agent-hooks/hooks.json");
 
 /// Embedded Codex hook template. Source: `codex/hooks/hooks.json`.
 const CODEX_HOOKS_JSON: &str = include_str!("../../../../codex/hooks/hooks.json");
@@ -61,10 +58,6 @@ pub const HOOK_BLOCK_END: &str = "# <<< prov";
 
 #[derive(Parser, Debug)]
 pub struct Args {
-    /// Print the (currently pre-v1) plugin install instructions and exit
-    /// without modifying the repo.
-    #[arg(long)]
-    pub plugin: bool,
     /// Enable team-mode sync at install time (configures the fetch refspec for
     /// the named remote). Defaults to local-only — sync is opt-in per-repo.
     #[arg(long, value_name = "REMOTE")]
@@ -89,11 +82,6 @@ enum AgentAdapter {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    if args.plugin {
-        print_plugin_instructions();
-        return Ok(());
-    }
-
     let cwd = std::env::current_dir().context("could not read current directory")?;
     let git = Git::discover(&cwd).map_err(|e| match e {
         prov_core::git::GitError::NotARepo => anyhow!("not in a git repo"),
@@ -185,22 +173,6 @@ fn adapters_label(adapters: &[AgentAdapter]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn print_plugin_instructions() {
-    println!("Claude Code plugin install:");
-    println!();
-    println!("  1. Install the prov binary so it's on PATH:");
-    println!("       cargo install prov");
-    println!("       # or: brew install mattfogel/tap/prov");
-    println!("       # or: curl -fsSL https://raw.githubusercontent.com/mattfogel/prov/main/install.sh | sh");
-    println!();
-    println!("  2. Inside Claude Code, run:");
-    println!("       /plugin install prov");
-    println!();
-    println!("  (Note: `prov install --plugin` does not modify this project's");
-    println!("  .claude/ directory. Use `prov install` without --plugin for the");
-    println!("  per-repo install path that wires hooks and config locally.)");
 }
 
 // -------- git config --------
@@ -312,12 +284,12 @@ pub(crate) fn claude_settings_path(git: &Git) -> PathBuf {
 }
 
 fn install_claude_settings(git: &Git) -> anyhow::Result<()> {
-    let plugin_hooks: Value = serde_json::from_str(PLUGIN_HOOKS_JSON)
-        .context("embedded plugin/hooks/hooks.json failed to parse")?;
+    let plugin_hooks: Value = serde_json::from_str(CLAUDE_HOOKS_JSON)
+        .context("embedded agent-hooks/hooks.json failed to parse")?;
     let plugin_hooks_obj = plugin_hooks
         .get("hooks")
         .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("embedded plugin hooks JSON missing top-level `hooks` object"))?
+        .ok_or_else(|| anyhow!("embedded agent-hooks/hooks.json missing top-level `hooks` object"))?
         .clone();
 
     let path = claude_settings_path(git);
