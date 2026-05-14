@@ -166,6 +166,21 @@ fn pre_push_blocks_unredacted_aws_key_in_new_note() {
 }
 
 #[test]
+fn pre_push_blocks_repo_provignore_pattern_in_new_note() {
+    let (tmp, head, public_sha) = repo_with_public_note("Discuss Project Phoenix rollout");
+    std::fs::write(tmp.path().join(".provignore"), "Project Phoenix\n").unwrap();
+    let stdin = format!("{NOTES_REF_PUBLIC} {public_sha} {NOTES_REF_PUBLIC} {ZERO_SHA}\n");
+
+    prov_in(tmp.path())
+        .args(["hook", "pre-push"])
+        .write_stdin(stdin)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("provignore-rule:0"))
+        .stderr(predicate::str::contains(&head));
+}
+
+#[test]
 fn pre_push_blocks_when_local_ref_is_private_regardless_of_remote() {
     // Catches the manual-mapping bypass:
     //   git push origin refs/notes/prompts-private:refs/notes/prompts

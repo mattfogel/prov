@@ -107,6 +107,24 @@ fn user_prompt_submit_creates_turn_file() {
 }
 
 #[test]
+fn user_prompt_submit_redacts_repo_provignore_patterns() {
+    let tmp = init_repo();
+    std::fs::write(tmp.path().join(".provignore"), "Project Phoenix\n").unwrap();
+    let payload = serde_json::json!({
+        "session_id": SID,
+        "prompt": "wire up Project Phoenix launch notes",
+        "cwd": tmp.path(),
+    });
+
+    fire_hook(tmp.path(), "user-prompt-submit", &payload.to_string());
+
+    let turn_path = staging_path(tmp.path()).join(SID).join("turn-0.json");
+    let body = std::fs::read_to_string(turn_path).unwrap();
+    assert!(body.contains("[REDACTED:provignore-rule:0]"));
+    assert!(!body.contains("Project Phoenix"));
+}
+
+#[test]
 fn adapter_qualified_claude_prompt_matches_legacy_prompt_capture() {
     let tmp = init_repo();
     fire_agent_hook(
