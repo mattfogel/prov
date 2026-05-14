@@ -27,6 +27,7 @@ use serde::Deserialize;
 
 use prov_core::git::{Git, GitError};
 use prov_core::privacy::is_prov_private;
+use prov_core::redactor::provignore::{ProvIgnore, ProvIgnoreError};
 use prov_core::redactor::Redactor;
 use prov_core::schema::{DerivedFrom, Edit, Note};
 use prov_core::session::SessionId;
@@ -129,7 +130,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let event_label = format!("{:?}", args.event);
     let result = match args.event {
-        Event::UserPromptSubmit => handle_user_prompt_submit(&staging, AgentHarness::Claude),
+        Event::UserPromptSubmit => handle_user_prompt_submit(&staging, AgentHarness::Claude, &git),
         Event::PostToolUse => {
             handle_post_tool_use(&staging, AgentHarness::Claude, Some(git.work_tree()))
         }
@@ -158,7 +159,7 @@ fn handle_agent_event(
     git: &Git,
 ) -> Result<(), HandlerError> {
     match event {
-        AgentEvent::UserPromptSubmit => handle_user_prompt_submit(staging, harness),
+        AgentEvent::UserPromptSubmit => handle_user_prompt_submit(staging, harness, git),
         AgentEvent::PostToolUse => handle_post_tool_use(staging, harness, Some(git.work_tree())),
         AgentEvent::Stop => handle_stop(staging, harness),
         AgentEvent::SessionStart => handle_session_start(staging, harness),
@@ -210,6 +211,7 @@ struct UserPromptSubmitPayload {
 fn handle_user_prompt_submit(
     staging: &Staging,
     _harness: AgentHarness,
+    git: &Git,
 ) -> Result<(), HandlerError> {
     let payload: UserPromptSubmitPayload = read_stdin_json()?;
     let raw_session = payload
@@ -229,7 +231,13 @@ fn handle_user_prompt_submit(
 
     // Redact even staged content. The redactor is the primary defense; pre-push
     // (U8) is the second line.
-    let redactor = Redactor::new();
+    let redactor = match redactor_for_repo(git.work_tree()) {
+        Ok(redactor) => redactor,
+        Err(e) => {
+            let _ = staging.append_log(&format!("{}: .provignore load failed: {e}", now_iso8601()));
+            Redactor::new()
+        }
+    };
     let redacted = redactor.redact(&prompt);
 
     let turn_index = staging.count_turns(&sid, private)?;
@@ -1476,7 +1484,14 @@ fn handle_pre_push(git: &Git) -> Result<PrePushOutcome, HandlerError> {
     }
 
     let mut blocks: Vec<String> = Vec::new();
-    let redactor = Redactor::new();
+    let redactor = match redactor_for_repo(git.work_tree()) {
+        Ok(redactor) => redactor,
+        Err(e) => {
+            return Ok(PrePushOutcome::Block(vec![format!(
+                "prov pre-push: .provignore could not be loaded: {e}"
+            )]));
+        }
+    };
 
     for raw in buf.lines() {
         let mut parts = raw.split_whitespace();
@@ -1618,6 +1633,11 @@ fn is_full_hex_sha(s: &str) -> bool {
 // =================================================================
 // shared helpers
 // =================================================================
+
+fn redactor_for_repo(work_tree: &Path) -> Result<Redactor, ProvIgnoreError> {
+    let provignore = ProvIgnore::from_path(work_tree.join(".provignore"))?;
+    Ok(Redactor::new().with_provignore(provignore))
+}
 
 #[derive(Debug, thiserror::Error)]
 enum HandlerError {
