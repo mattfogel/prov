@@ -14,8 +14,8 @@ you turn that buried context into answers when the user asks about it.
 
 - **Capture happens automatically** in the background: harness hooks stage the
   prompt + edits during a session, and a `post-commit` git hook attaches the
-  staged context to the resulting commit as a note on `refs/notes/prov` (or
-  `refs/notes/prov-private`).
+  staged context to the resulting commit as a note on `refs/notes/prompts` (or
+  `refs/notes/prompts-private`).
 - **You read it via the CLI.** The two surfaces you'll use are `prov log` and
   `prov search`. Output is human-readable by default; pass `--json` when you
   want a machine-readable envelope.

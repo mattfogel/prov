@@ -15,7 +15,7 @@ Four hooks, each with a 5-second timeout:
 
 The hooks only write to `<git-dir>/prov-staging/`; nothing they emit reaches
 the agent's prompt. The staged content is flushed into a git note on
-`refs/notes/prov` by the `post-commit` git hook (also installed by
+`refs/notes/prompts` by the `post-commit` git hook (also installed by
 `prov install`).
 
 ## Install

@@ -18,7 +18,7 @@ any meaningful edit to `SKILL.md`'s `description:` or body.
 4. Use a fixture repo seeded with provenance notes — either a real repo
    where Claude Code has been used for a few sessions, or the fixture under
    `crates/prov-cli/tests/fixtures/` extended with a manually-crafted note
-   via `git notes --ref=refs/notes/prov add`.
+   via `git notes --ref=refs/notes/prompts add`.
 
 ## Scenario 1 — "why" question on a specific line triggers the skill
 
