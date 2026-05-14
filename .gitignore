@@ -29,3 +29,5 @@ docs/
 # Local agent/hook config (forkers should run `prov install` themselves)
 .codex/
 .claude/
+.agents/
+skills-lock.json

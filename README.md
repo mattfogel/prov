@@ -20,15 +20,6 @@ Prov sits at three points in a normal developer workflow:
 
 Notes live under `refs/notes/prov` (shared) and `refs/notes/prov-private` (local-only). Out of the box, nothing leaves your machine.
 
-## What this is (and isn't)
-
-Prov is an open-source tool I'm building because I want it to exist. **It is not a product.** No telemetry, no hosted service, no signups, no paid tier — and no commitment to a roadmap beyond what fits in nights-and-weekends maintenance.
-
-Other tools have shipped with similar core architecture: per-line AI authorship in git notes, SQLite cache, rewrite preservation, multi-agent attribution. Prov is not novel on storage. The honest differentiators are:
-
-- **Agent-first, harness-agnostic posture.** Giving an agent access to its own prior reasoning is a different category of capability — not just better tooling for humans, but better continuity across sessions and harnesses.
-- **Redactor-by-default-when-shared.** Notes are local-only out of the box; opting in to team sharing (`prov install --enable-push <remote>`) turns on a write-time secret-detector pipeline plus a pre-push gate. The redaction story matters when you choose to share.
-
 ## Install
 
 Until the first tagged release ships, install from source:
@@ -90,7 +81,3 @@ Run `./scripts/check.sh` before opening a PR — it mirrors CI (build, test, `ca
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) **OR** [Apache-2.0](LICENSE-APACHE) at your option, matching Rust ecosystem convention.
-
-## Posture
-
-Maintained as time permits. No SLA. No roadmap commitments. Issues and PRs welcome; responsiveness varies. The codebase stays small and forkable on purpose — the whole thing should be auditable in an afternoon by anyone who wants to know what's running on their repo.
