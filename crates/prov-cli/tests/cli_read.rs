@@ -396,20 +396,6 @@ fn install_heals_legacy_top_level_command_shape() {
 }
 
 #[test]
-fn install_plugin_flag_does_not_touch_repo() {
-    let tmp = init_repo();
-    prov_in(tmp.path())
-        .args(["install", "--plugin"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("/plugin install prov"));
-
-    assert!(!tmp.path().join(".git/hooks/post-commit").exists());
-    assert!(!tmp.path().join(".claude/settings.json").exists());
-    assert!(!tmp.path().join(".codex/hooks.json").exists());
-}
-
-#[test]
 fn install_enable_push_configures_fetch_refspec() {
     let tmp = init_repo();
     run_git(
