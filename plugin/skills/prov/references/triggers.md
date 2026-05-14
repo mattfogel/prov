@@ -1,93 +1,126 @@
-# Triggers — when is the change substantive enough to query?
+# Triggers — recognizing a provenance question
 
-Heuristics for deciding whether to call `prov log` before proposing an edit.
-Use this when the user's ask sits in the gray zone between "trivial" and
-"substantive."
+This skill activates on user questions about the *origin*, *intent*, or
+*history* of code that already exists. The lever for activation is the
+user's phrasing, not the file or the kind of work in progress. This page
+maps common phrasings to the right query.
 
-## Default rule of thumb
+## Phrasings that should trigger
 
-Query provenance if **all three** are true:
+### "Why does this code do X?" / "Why is this set to Y?"
 
-1. The file already exists with non-trivial content (more than ~10 lines).
-2. The change touches behavior, structure, or public surface — not pure
-   cosmetics.
-3. The user's request would change how the code *works*, not just how it
-   *looks*.
+The user wants the *reason* behind a specific behavior. The originating
+prompt usually carries the reason (compliance constraint, perf trade-off,
+a hard-won bug fix). Query with a **point lookup** on the line that encodes
+the behavior:
 
-If any of the three is false, skip the query.
+```bash
+prov log src/payments.ts:247
+```
 
-## Substantive — query first
+If the user named a function instead of a line, run `grep` or open the
+file to find the relevant line, then look it up.
 
-These changes warrant a `prov log` call before proposing code:
+### "What was the prompt for this?" / "Show me the prompt that wrote this."
 
-- **Refactor** — extract function, inline, rename across call sites,
-  reorganize control flow, change a class hierarchy.
-- **Rewrite** — replace a block with a different implementation of the same
-  behavior.
-- **Behavior change** — change a default, threshold, retry policy, validation
-  rule, error strategy, timeout, cache key, or any value/condition that
-  alters runtime behavior.
-- **Public surface change** — modify a function signature, add/remove a
-  parameter, change an exported type, alter an API contract.
-- **Debugging an existing bug** — when the user asks "why does this happen"
-  and the answer might be encoded in the original prompt's constraints
-  (e.g., a deliberate trade-off the prompt called for).
-- **Adding error handling around AI-written code** — the original error
-  strategy may already exist; a new layer can conflict with retry middleware,
-  fallback logic, or framework error handling.
-- **Adding a new branch to existing logic** — branches compose with the
-  control flow the prompt shaped; the prompt may have explicitly excluded
-  the branch you're adding.
+Direct ask. Same query — point lookup if they referenced a specific line
+or block; whole-file lookup if they said "this file":
 
-## Trivial — skip the query
+```bash
+prov log src/payments.ts:247
+prov log src/payments.ts
+```
 
-These changes do not warrant a query:
+### "Who wrote this?" / "Did the agent write this?" / "Which model?"
 
-- **Typo fixes** — single-character or single-word corrections.
-- **Comment edits** — adding, removing, or rewording comments without
-  touching code.
-- **Formatting** — whitespace, indentation, line wrapping, import sorting.
-- **Lint fixes** — applying a linter rule (unused import removal, prefer-
-  const, etc.) where the rule itself dictates the change.
-- **Pure rename of a single local variable** — when the rename doesn't
-  cross file boundaries and doesn't change the public surface.
-- **Adding a log line** — `console.log`, `tracing::debug!`, `print` for
-  debugging, with no other change.
-- **Removing dead code** the user has already identified as unused.
-- **Greenfield writes** — new file, new function inserted alongside
-  existing ones, new test case in a fresh test block.
+The user wants attribution: human vs. AI, and which model. Run a point
+lookup; the response includes `model`, `conversation_id`, `turn_index`,
+and `blame_commit`. If `status` is `no_provenance`, fall back to
+`git blame` and tell the user this looks human-authored or pre-dates
+`prov install`.
 
-## Gray zone — use judgment
+### "What's the history of this file?" / "What prompts have shaped this?"
 
-When the change is genuinely ambiguous:
+Whole-file lookup, most useful for files with several captured edits:
 
-- **"Add a test for this function"** — querying the function's prompt may
-  reveal what behavior the original turn intended to enforce, which informs
-  the test cases. Worth a query if the function has visible business logic;
-  skip for pure utility functions.
-- **"Fix this bug"** — the bug fix may be trivial (off-by-one, null check)
-  or it may require understanding the original constraint. Read the diff the
-  user is asking you to fix; if the broken behavior is in AI-written code,
-  query.
-- **"Make this faster"** — performance changes often preserve behavior, but
-  the original prompt may have called out a correctness/perf trade-off
-  ("don't cache — staleness matters more than latency"). Worth a query.
-- **Configuration changes** — the `paths:` glob excludes `*.json`,
-  `*.yaml`, `*.toml`, etc. by default, but if the user asks about a
-  config-adjacent code file (e.g., a TS file that builds config), the
-  default substantive rules apply.
+```bash
+prov log src/payments.ts
+```
 
-## Cost of querying when you didn't need to
+If the user wants AI-on-AI rewrites surfaced too, add `--history`.
 
-Low. `prov log --only-if-substantial` returns empty quickly for short or
-note-less files. Erring toward "query" is cheap; the cost is one extra
-sub-50ms tool call.
+### "Has this line been hand-edited since the AI wrote it?" / "Is this drifted?"
 
-## Cost of skipping when you should have queried
+Point lookup. The `status` field answers directly: `unchanged`, `drifted`,
+or `no_provenance`. A `drifted` response includes `blame_author_after` so
+you can tell the user who edited it.
 
-High. The agent may reintroduce a bug the original prompt explicitly
-prevented, or rewrite a deliberate constraint as if it were an arbitrary
-choice. The user typically doesn't know the constraint exists either —
-that's why it lives in the prompt rather than a comment.
+### "Find prompts about X" / "Where did we decide to use X?"
 
-When in doubt, query.
+Cross-file search:
+
+```bash
+prov search "rate limiting"
+```
+
+Returns matching prompts with the commits and files they touched. Pair the
+results with `git log` if the user wants to walk the decision history.
+
+### "What session was this from?" / "What conversation produced this?"
+
+Point lookup. The response carries `conversation_id` and `turn_index`. The
+user can use those to find the original transcript in their agent harness.
+
+## Phrasings that should NOT trigger
+
+The skill is only for *origin/intent/history* questions. Skip it for:
+
+- **Edit requests** — "refactor this", "rename X to Y", "extract this into
+  a function", "fix this bug". Even if the file is AI-authored, don't run
+  `prov log` preemptively. If the user follows up with "why did the
+  original prompt set X to Y", *then* it's a provenance question.
+- **Greenfield asks** — "create a new file", "write a function that does
+  X". There's nothing to query.
+- **Pure code-reading asks** — "what does this function do" (the answer is
+  in the code itself), "trace the call graph" (use grep/code reading), "is
+  this used anywhere" (use grep). These are about the *current code*, not
+  its origin.
+- **Project-level questions** that aren't about specific code — "what's
+  this project about" (read the README), "how is the codebase organized"
+  (read the structure).
+
+If the user's phrasing is ambiguous between "what does this code do" and
+"why does this code do X", lean on whichever interpretation they emphasize.
+"Why" and "what for" lean provenance; "what" and "how" lean code-reading.
+
+## Gray-zone phrasings
+
+These genuinely could go either way; use judgment:
+
+- **"Explain this code"** — usually a code-reading ask, but if the code has
+  unusual constants or non-obvious branches, the originating prompt may
+  carry the explanation. Worth a quick point lookup; if `no_provenance`,
+  fall back to explaining from the code.
+- **"What's the intent here?"** — usually leans provenance ("intent" maps
+  to the original prompt), but if the file has no captured notes, treat as
+  a code-reading ask.
+- **"Is this still correct?"** — leans code-review, but a provenance check
+  can reveal whether the current behavior matches the original spec
+  (drift). Worth a point lookup if the user is questioning correctness.
+
+## How user follow-ups shift the work
+
+After you answer a provenance question, the user often asks a follow-up
+that *is* an edit ("OK, then change the window to 60 days"). That follow-up
+isn't itself a provenance question, but the context you just established
+should inform the edit:
+
+- If the prompt called the value out as load-bearing ("compliance requires
+  ..."), flag the constraint before making the change.
+- If the line was already `drifted`, the existing value may be a human
+  override worth preserving — ask before overwriting.
+- If the prompt was an arbitrary default ("just pick a sensible window"),
+  the change is uncontroversial.
+
+That's not the skill firing again — it's you carrying the answer you
+already produced into the next turn.

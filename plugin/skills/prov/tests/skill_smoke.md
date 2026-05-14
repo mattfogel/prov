@@ -1,104 +1,152 @@
 # Skill smoke test plan (manual)
 
-These four behavioral scenarios are the load-bearing verification for U12.
-They run against a real Claude Code session — there is no automated harness
-that tests trigger fidelity. Run them after every meaningful edit to
-`SKILL.md`'s `description:` or body.
+These behavioral scenarios are the load-bearing verification for the
+question-triggered shape of this skill. There is no automated harness that
+tests trigger fidelity — run them against a real Claude Code session after
+any meaningful edit to `SKILL.md`'s `description:` or body.
 
 ## Setup
 
-1. Install the prov binary so it's on `PATH`.
+1. Install the `prov` binary so it's on `PATH`.
 2. Install this plugin (`/plugin install --plugin-dir <repo>/plugin` or
    marketplace).
-3. Restart Claude Code so hooks reload.
-4. Use a fixture repo seeded with prov notes — either:
-   - A real repo where you've used Claude Code for a few sessions, or
-   - The fixture under `crates/prov-cli/tests/fixtures/` extended with
-     a manually-crafted note via `git notes --ref=refs/notes/prompts add`.
+3. Restart Claude Code so the skill registry reloads.
+4. Use a fixture repo seeded with provenance notes — either a real repo
+   where Claude Code has been used for a few sessions, or the fixture under
+   `crates/prov-cli/tests/fixtures/` extended with a manually-crafted note
+   via `git notes --ref=refs/notes/prov add`.
 
-## Scenario 1 — substantive ask triggers the skill
+## Scenario 1 — "why" question on a specific line triggers the skill
+
+**Prompt to Claude Code:**
+> Why is `src/payments.ts:247` set to 90 days?
+
+**Expected behavior:**
+- Agent runs `prov log src/payments.ts:247` (with or without `--json`).
+- Agent surfaces the originating prompt verbatim in the answer.
+- Answer names the load-bearing constraint (e.g., "compliance requires
+  90-day dedupe") and attributes it to the model + session.
+
+**Pass criteria:** the agent ran `prov log` and quoted the prompt in its
+answer.
+
+## Scenario 2 — file-level history question triggers the skill
+
+**Prompt to Claude Code:**
+> What's the prompt history of `src/payments.ts`?
+
+**Expected behavior:**
+- Agent runs `prov log src/payments.ts`.
+- Agent renders the captured edits with prompts, models, and timestamps,
+  most recent first.
+
+**Pass criteria:** the agent ran the whole-file query and listed at least
+one prompt.
+
+## Scenario 3 — search question triggers the skill
+
+**Prompt to Claude Code:**
+> Find the prompts where we talked about rate limiting.
+
+**Expected behavior:**
+- Agent runs `prov search "rate limiting"`.
+- Agent renders the hits with the prompts and the files/commits they
+  touched.
+
+**Pass criteria:** the agent ran `prov search` rather than grepping the
+codebase.
+
+## Scenario 4 — drifted line surfaces the divergence
+
+**Setup detail:** seed the fixture so line 247 has been hand-edited since
+the original AI capture, so `prov log src/payments.ts:247 --json` returns
+`status: "drifted"`.
+
+**Prompt to Claude Code:**
+> Why is `src/payments.ts:247` set to its current value?
+
+**Expected behavior:**
+- Agent runs `prov log src/payments.ts:247`.
+- Answer surfaces both the *original* AI prompt AND the divergence (the
+  current value differs from the AI capture, and `blame_author_after`
+  shows who changed it).
+- Agent flags that the current value may be a deliberate human override.
+
+**Pass criteria:** the answer names both the original intent and the
+drift.
+
+## Scenario 5 — edit request does NOT trigger the skill
 
 **Prompt to Claude Code:**
 > Refactor `src/payments.ts` to extract the dedupe logic into a separate
 > module.
 
 **Expected behavior:**
-- Agent calls `prov log src/payments.ts` (or `:<line>`) before proposing
-  edits.
-- Agent surfaces the prior dedupe-window prompt in its plan, e.g.,
-  *"the originating prompt called for a 90-day window for compliance — I'll
-  preserve that."*
-- Final edit preserves the load-bearing constraint.
+- Agent does NOT preemptively run `prov log`.
+- Agent proceeds with the refactor; it may read the file, plan, and edit
+  as normal.
 
-**Pass criteria:** the agent runs `prov log` and cites the prompt before
-writing code.
+**Pass criteria:** no `prov log` invocation appears in the session log
+unless the user asked a provenance follow-up.
 
-## Scenario 2 — trivial single-line change does NOT trigger
+This is the central regression the rewrite exists to prevent — the prior
+shape of the skill ran `prov log` before any non-trivial edit, which
+created unwanted context bloat and noise.
+
+## Scenario 6 — no-provenance case is reported plainly
 
 **Prompt to Claude Code:**
-> Fix the typo on line 12 of `README.md`.
+> Who wrote `src/utils.ts:5`?
+
+**Setup detail:** ensure `src/utils.ts:5` has no captured note (a
+human-authored line in a fresh repo works).
 
 **Expected behavior:**
-- Agent does not call `prov log`.
-- The `paths:` glob excludes `*.md`, so the skill should not even surface.
+- Agent runs `prov log src/utils.ts:5`.
+- Response is `status: "no_provenance"` (or similar).
+- Agent answers plainly: "No provenance recorded for that line — likely
+  human-authored or predates `prov install`," optionally falling back to
+  `git blame`.
 
-**Pass criteria:** no `prov log` invocation in the session log.
+**Pass criteria:** the agent neither invents an explanation nor treats the
+empty response as an error.
 
-## Scenario 3 — greenfield does NOT trigger
+## Scenario 7 — greenfield / non-provenance question does NOT trigger
 
 **Prompt to Claude Code:**
 > Create a new file `src/utils/format.ts` with a function that formats a
 > Date as `YYYY-MM-DD`.
 
 **Expected behavior:**
-- Agent does not call `prov log` — the file doesn't exist yet, so there's
-  no provenance to query.
-- If the agent does call it, the response should be empty (no notes for a
-  non-existent file) and the agent should proceed without it.
+- Agent does NOT run `prov log` or `prov search`.
+- Agent writes the file as requested.
 
-**Pass criteria:** either the agent skips the query, or queries it and
-correctly handles the empty response without surfacing it as a finding.
-
-## Scenario 4 — drifted line surfaces drift state
-
-**Prompt to Claude Code:**
-> Explain `src/payments.ts:247`.
-
-**Setup detail:** ensure the line at 247 has been hand-edited since the
-original AI capture, so `prov log src/payments.ts:247 --json` returns
-`status: "drifted"`.
-
-**Expected behavior:**
-- Agent calls `prov log src/payments.ts:247`.
-- Agent's explanation references both the original prompt AND the drift
-  state, e.g., *"originally written by Claude in turn 4 of session
-  sess_abc123 against the prompt 'add a 90-day dedupe window'; the line
-  has since been hand-edited (drifted)."*
-
-**Pass criteria:** explanation surfaces both the original intent and the
-divergence.
+**Pass criteria:** no `prov` invocation in the session log.
 
 ## Iteration loop
 
 If a scenario fails:
 
-- **Trigger fails for substantive asks (false negatives)** — the
-  `description:` field is the lever. Add more trigger phrasing
-  ("before refactoring", "before editing AI-written code",
-  "to recover the original prompt"). Re-test.
-- **Trigger fires for trivial asks (false positives)** — strengthen the
-  "When NOT to use it" section in the body and add explicit exclusions to
-  `description:`. Re-test.
-- **Drift state isn't surfaced** — the `references/querying.md` example
-  for drifted lines is the prompt the agent learns from. Make the example
-  louder.
+- **Trigger fails for a provenance question (false negative)** — the
+  `description:` field is the lever. Add the missing phrasing pattern to
+  both `description:` and the "Phrasings that should trigger" section of
+  `references/triggers.md`. Re-test.
+- **Trigger fires on an edit/refactor/greenfield ask (false positive)** —
+  the rewrite's central failure mode. Strengthen the "Phrasings that
+  should NOT trigger" section and reinforce the negative in
+  `description:`. Re-test until the false positive goes away.
+- **Drift state isn't surfaced** — the example in `references/querying.md`
+  for drifted lines is the prompt the agent learns from. Make it louder
+  and more specific.
 
 ## Content lints (automated)
 
-These lints run in CI via `crates/prov-cli/tests/cli_plugin_layout.rs`:
+These lints run in CI via `crates/prov-cli/tests/cli_skill_layout.rs`:
 
 - `SKILL.md` exists and parses as YAML+Markdown.
-- Frontmatter has `name` and `description` (both non-empty).
+- Frontmatter has `name` and `description` (both non-empty; `description`
+  ≥ 60 characters).
 - Body is at most 500 lines.
 - `references/querying.md` and `references/triggers.md` exist and are
   referenced by name from `SKILL.md`.
+- This smoke test plan exists at `tests/skill_smoke.md`.

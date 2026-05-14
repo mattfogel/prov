@@ -8,7 +8,7 @@
 Prov captures the prompt-and-conversation context behind AI-agent-driven edits, attaches it to commits via git notes, and exposes it through thin read surfaces:
 
 - **CLI** for humans — `prov log src/auth.ts:42` returns the originating prompt for any line.
-- **Agent skills and hooks** for supported harnesses — Claude Code and Codex can capture provenance today, and agents can query their prior reasoning before proposing edits.
+- **Agent skills and hooks** for supported harnesses — Claude Code and Codex capture provenance automatically during sessions, and an agent skill teaches the agent to answer the user's provenance questions ("why does this do X", "what was the prompt that wrote this", "what's the history of this file") on demand.
 
 ## How it works
 

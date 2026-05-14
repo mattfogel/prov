@@ -1,21 +1,22 @@
 # Querying provenance
 
-Concrete patterns for calling `prov log` from the agent loop, with example
-JSON output and how to integrate findings into the planning step.
+Concrete patterns for calling `prov log` and `prov search` when the user has
+asked about the origin, intent, or history of code. Example JSON shapes and
+notes on how to compose the answer.
 
-## Two query shapes
+## Three query shapes
 
-### Point lookup — `prov log <file>:<line> --json`
+### Point lookup — `prov log <file>:<line> [--json]`
 
-Use when the user references a specific line, or when the proposed change
-touches a small contiguous range and you want the originating prompt for
-that range.
+Use when the user asks about a specific line or a small contiguous range
+("why is line 247 doing X", "what was the prompt for this if-branch").
 
 ```bash
-prov log src/payments.ts:247 --only-if-substantial --json
+prov log src/payments.ts:247 --json
 ```
 
-Example output for an unchanged line:
+Example output for an **unchanged** line (current code still matches the
+original AI capture):
 
 ```json
 {
@@ -32,7 +33,8 @@ Example output for an unchanged line:
 }
 ```
 
-Example output for a drifted line (current code no longer matches AI capture):
+Example output for a **drifted** line (current code differs from the
+original AI capture — someone hand-edited it):
 
 ```json
 {
@@ -50,7 +52,7 @@ Example output for a drifted line (current code no longer matches AI capture):
 }
 ```
 
-Example output when no provenance is available:
+Example output when there is no provenance for the line:
 
 ```json
 {
@@ -62,13 +64,14 @@ Example output when no provenance is available:
 }
 ```
 
-### Whole-file context — `prov log <file> --json`
+### Whole-file history — `prov log <file> [--json]`
 
-Use when the change spans the file or you want the prompt history before
-planning a structural edit.
+Use when the user asks about the file overall ("what's the history of
+`src/payments.ts`", "what prompts have shaped this file", "show me every AI
+edit on this file").
 
 ```bash
-prov log src/payments.ts --only-if-substantial --json
+prov log src/payments.ts --json
 ```
 
 Example output:
@@ -101,68 +104,89 @@ Example output:
 }
 ```
 
-The `edits` array is ordered by recency (most recent first). `history`
-carries superseded prior prompts when an AI rewrite replaced an earlier AI
-edit on the same span.
+The `edits` array is ordered most-recent first. `history` is populated when
+you pass `--history`: it carries superseded prior prompts that an AI rewrite
+replaced.
 
-## Empty result handling
+### Prompt search — `prov search <query> [--json]`
 
-`--only-if-substantial` returns empty for short files (< 10 lines) or files
-with no existing notes:
+Use when the user asks "where did we decide X" or "find the prompts where
+we talked about Y" — the question isn't about a specific file or line, it's
+about a topic that may have surfaced in multiple prompts.
 
-```json
-{ "file": "src/utils.ts", "edits": [], "history": [], "prov_version": "0.1.1" }
+```bash
+prov search "rate limiting" --json
 ```
 
-Empty is not an error. Proceed with the edit normally.
+Returns matching prompts with the commits and files they touched. Useful
+for tracing the lineage of a decision across a codebase ("when did we first
+introduce rate limiting? which prompts framed it?").
 
-## Integrating into planning
+## Useful flags
 
-When the result has provenance, surface the prompt into your planning step
-**before** proposing code changes. Example planning frame:
+- `--json` — machine-readable envelope. Use whenever you'll pick a single
+  field or correlate with other tool output. The human-readable rendering
+  is fine when you'll just quote the prompt back to the user.
+- `--history` — on `prov log`, walks `derived_from` so AI-on-AI rewrites
+  show the superseded prior prompts. Useful for "what did this look like
+  before".
+- `--only-if-substantial` — returns empty for files under 10 lines or files
+  with no captured notes. Rarely needed here: the user has *already* asked
+  about a specific file, so substantiality is implicit. Use it only if you
+  want to suppress noise on tiny files.
+- `--full` — reserved for future transcript expansion; currently prints the
+  stored `preceding_turns_summary`.
 
-> Before refactoring `src/payments.ts:247`, I checked the originating prompt
-> via `prov log`. The line was written in turn 4 of session `sess_abc123` on
-> 2026-03-12 against the prompt:
->
-> > "Add a 90-day dedupe window on payment intents — compliance requires we
-> > never charge twice within a quarter even if the idempotency key collides."
->
-> The 90-day window is therefore a load-bearing constraint, not an arbitrary
-> default. The user's current request ("rename the field to `windowDays`")
-> is a cosmetic change and should preserve the value. I'll rename without
-> changing the constant.
+## Composing the answer
 
-If the line is `drifted`, frame both the original intent AND the divergence:
+When provenance is present, **quote the prompt verbatim** — paraphrase
+loses constraint nuance ("90-day dedupe window" carries the unit and the
+implied compliance horizon; "a long dedupe window" doesn't).
 
-> `prov log` reports this line as drifted — the current code differs from
-> the original AI capture (the prompt asked for 90 days; the current value
-> is 30). `blame_author_after` shows alice@example.com edited it on
-> 2026-04-02. Likely a deliberate human override; before changing it again
-> I'll ask whether the 30-day value is intentional.
+Include the load-bearing metadata: model, conversation id, turn index,
+timestamp, commit. The user often cares about *which session* introduced
+the code so they can find the conversation.
+
+For drifted lines, name both the original intent and the divergence so the
+user can decide which to trust:
+
+> Originally written by `claude-sonnet-4-5` against the prompt "add a 90-day
+> dedupe window for compliance"; the current value is 30 days, edited by
+> `alice@example.com` on 2026-04-02 in commit `b3c4d5e`. Two plausible
+> reads: Alice deliberately overrode the compliance default, or this was an
+> ad-hoc tweak that broke the original constraint. Worth confirming with
+> Alice.
+
+For `no_provenance` or empty results, say so plainly. Don't invent
+explanations — the line is either human-authored, predates `prov install`,
+or comes from a teammate who hasn't shared their notes ref.
 
 ## Bash idioms
 
-If you want a single field from the JSON output, pipe through `jq`:
+Pick a single field from JSON output with `jq`:
 
 ```bash
-prov log src/payments.ts:247 --only-if-substantial --json | jq -r '.prompt'
+prov log src/payments.ts:247 --json | jq -r '.prompt'
+prov log src/payments.ts --json | jq -r '.edits[] | "\(.timestamp) \(.prompt)"'
 ```
 
-For shell-based agents that don't have `jq` available, parse the JSON
-directly in your tool runtime. The shape is stable across `prov_version`
-within v0.x; consult `prov_version` in the envelope before trusting future
-fields not documented here.
+If `jq` isn't available, parse the JSON in your tool runtime. The shape is
+stable across `prov_version` within v0.x; consult the `prov_version` field
+before relying on fields not documented here.
 
 ## Failure modes to handle gracefully
 
-- `prov: command not found` — the binary isn't on PATH. Skip and proceed.
-- `not in a git repo` — the cwd isn't inside a git repo. Skip.
-- `.git/prov.db` missing — user hasn't run `prov install` here. Skip.
-- Empty stdout (with `--only-if-substantial`) — file is short or has no
-  notes. Proceed without provenance.
-- `status: "no_provenance"` on a point lookup — the specific line has no
-  resolvable note. Proceed without it.
+- `prov: command not found` — the binary isn't on PATH. Tell the user
+  `prov` isn't installed and offer the install command from the project
+  README.
+- `not in a git repo` — answer "I can't query provenance outside a git
+  repo."
+- `.git/prov.db` missing — `prov install` hasn't been run here. Tell the
+  user.
+- Empty stdout / `edits: []` — no captured edits. Tell the user plainly.
+- `status: "no_provenance"` on a point lookup — the line has no note.
+  Likely human-authored or predates install.
 
-In every failure case, the right move is to proceed with the edit. Provenance
-is additive context; its absence never blocks the user's request.
+In every failure case the right move is to surface the absence to the user
+and answer their question with what you can derive from other sources
+(`git blame`, `git log`, the code itself).

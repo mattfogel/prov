@@ -7,8 +7,10 @@ for [prov](https://github.com/mattfogel/prov), the prompt-provenance tool. It bu
   (`UserPromptSubmit`, `PostToolUse` matched on `Edit|Write|MultiEdit`, `Stop`,
   `SessionStart`). Each hook calls `prov hook <event>` with a 5-second timeout.
 - `skills/prov/SKILL.md` — teaches the agent to query its own prior reasoning
-  (`prov log <file>:<line>`) before substantive edits. *(See U12 in the plan;
-  the SKILL ships in a separate unit and is referenced here for completeness.)*
+  (`prov log <file>:<line>`, `prov search <query>`) when the user asks about
+  code provenance ("why does this do X", "what was the prompt for this line",
+  "what's the history of this file"). The skill is question-triggered, not
+  edit-triggered — it does not preemptively query before refactors or edits.
 
 ## Prerequisites
 
