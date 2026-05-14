@@ -5,6 +5,10 @@
 
 > Git blame tells you who. Prov tells you why.
 
+<img src="screenshots/prov-log-line.png" alt="prov log on a single line of a file returns the originating prompt, the model, the capture timestamp, the session id, and the commit" width="720">
+
+<img src="screenshots/prov-log-file.png" alt="prov log on a whole file lists every captured prompt that touched it, newest first" width="720">
+
 Prov captures the prompt-and-conversation context behind AI-agent-driven edits, attaches it to commits via git notes, and exposes it through thin read surfaces:
 
 - **CLI** for humans — `prov log src/auth.ts:42` returns the originating prompt for any line.
