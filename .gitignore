@@ -25,3 +25,7 @@ action/.npm/
 
 # Local-only docs (not tracked)
 docs/
+
+# Local agent/hook config (forkers should run `prov install` themselves)
+.codex/
+.claude/
